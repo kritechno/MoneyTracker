@@ -1,0 +1,15 @@
+[Unit]
+Description=MoneyTracker Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/MoneyTracker
+ExecStart=/home/ubuntu/MoneyTracker/.venv/bin/python3 /home/ubuntu/MoneyTracker/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

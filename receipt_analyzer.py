@@ -1,12 +1,26 @@
 import json
+import logging
+import time
 from datetime import date
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 from config import CATEGORIES, CURRENCIES, GEMINI_API_KEY, GEMINI_MODEL
 
+logger = logging.getLogger("moneytracker")
+
 _client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Транзитные ошибки Gemini (перегрузка/лимит) — повторяем с нарастающей паузой,
+# иначе один 503 «high demand» молча теряет трату пользователя.
+_RETRY_CODES = {429, 500, 503}
+_RETRY_BACKOFF = (1.0, 3.0)  # паузы перед повторами; всего попыток = len + 1
+
+
+class ModelOverloaded(Exception):
+    """Gemini вернул 429/500/503 после всех повторов — стоит попробовать позже."""
 
 _SYSTEM = f"""Ты — ассистент по учёту трат. На вход поступает фото чека и/или подпись пользователя.
 Определи трату и верни СТРОГО один JSON-объект без пояснений и markdown.
@@ -90,15 +104,32 @@ def analyze(
         )
     parts.append(types.Part.from_text(text=prompt))
 
-    response = _client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[types.Content(role="user", parts=parts)],
-        config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM,
-            max_output_tokens=1024,
-            temperature=0,
-            response_mime_type="application/json",
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-        ),
-    )
+    response = _generate(parts)
     return _normalize(_extract_json(response.text), default_currency)
+
+
+def _generate(parts: list):
+    config = types.GenerateContentConfig(
+        system_instruction=_SYSTEM,
+        max_output_tokens=1024,
+        temperature=0,
+        response_mime_type="application/json",
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+    )
+    last_exc = None
+    for pause in (*_RETRY_BACKOFF, None):
+        try:
+            return _client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[types.Content(role="user", parts=parts)],
+                config=config,
+            )
+        except genai_errors.APIError as exc:
+            if exc.code not in _RETRY_CODES:
+                raise
+            last_exc = exc
+            if pause is None:
+                break
+            logger.warning("Gemini %s, повтор через %.0f c", exc.code, pause)
+            time.sleep(pause)
+    raise ModelOverloaded(str(last_exc)) from last_exc

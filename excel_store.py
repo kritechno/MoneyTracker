@@ -2,6 +2,7 @@ import csv
 import io
 import os
 import re
+import shutil
 import tempfile
 from datetime import date, datetime
 
@@ -41,6 +42,21 @@ def _atomic_save(wb: Workbook) -> None:
         if os.path.exists(tmp):
             os.remove(tmp)
         raise
+
+
+def restore_workbook(data: bytes) -> list[str]:
+    """Проверяет загруженный .xlsx и делает его активным файлом трат.
+    Текущий файл сначала бэкапится. Используется для заливки истории на
+    Railway Volume (пользователь шлёт expenses.xlsx документом в чат).
+    Возвращает список листов восстановленной книги; бросает исключение,
+    если файл не открывается как .xlsx."""
+    wb = load_workbook(io.BytesIO(data))  # битый/не-xlsx → исключение, файл не тронут
+    if os.path.exists(EXCEL_PATH):
+        folder = os.path.dirname(os.path.abspath(EXCEL_PATH))
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        shutil.copy2(EXCEL_PATH, os.path.join(folder, f"expenses_backup_restore_{stamp}.xlsx"))
+    _atomic_save(wb)
+    return wb.sheetnames
 
 
 def _init_wallet_sheet(ws) -> None:

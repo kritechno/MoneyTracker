@@ -3,7 +3,9 @@ import os
 
 from config import CURRENCIES
 
-_PATH = os.path.join(os.path.dirname(__file__), "settings.json")
+# Путь к settings.json. На Railway указывает на persistent Volume (SETTINGS_PATH),
+# иначе настройки/владелец/профили сотрутся при каждом редеплое. Локально — рядом с кодом.
+_PATH = os.getenv("SETTINGS_PATH") or os.path.join(os.path.dirname(__file__), "settings.json")
 
 # Профиль по умолчанию: все исторические траты лежат на листах «Расходы»/«Итоги».
 DEFAULT_PROFILE = "FDTG tour 2026"

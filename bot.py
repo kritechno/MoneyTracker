@@ -537,11 +537,38 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text(
             "🤔 Не разобрал сумму на чеке. Добавь подпись с суммой, например «4500 тенге»."
         )
+    except receipt_analyzer.ModelOverloaded:
+        await msg.reply_text(
+            "⏳ Gemini сейчас перегружен. Пришли чек ещё раз через минуту — трата не записана."
+        )
     except Exception:
         logger.exception("Ошибка обработки фото")
         await msg.reply_text(
             "⚠️ Не получилось обработать чек. Попробуй ещё раз или добавь подпись с суммой."
         )
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Восстановление трат: пользователь шлёт .xlsx → делаем его активным файлом.
+    Нужно для заливки истории на Railway Volume (чистый Volume → отправил файл — готово)."""
+    msg = update.message
+    await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+    try:
+        tg_file = await msg.document.get_file()
+        data = bytes(await tg_file.download_as_bytearray())
+        async with _excel_lock:
+            sheets = await asyncio.to_thread(excel_store.restore_workbook, data)
+    except Exception:
+        logger.exception("Ошибка восстановления файла")
+        await msg.reply_text(
+            "⚠️ Не смог прочитать файл — он повреждён или это не .xlsx, выгруженный из бота."
+        )
+        return
+    await msg.reply_text(
+        "✅ Файл трат восстановлен.\nЛисты: "
+        + ", ".join(sheets)
+        + "\nПрежний файл сохранён в бэкап."
+    )
 
 
 async def _create_profile_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -667,6 +694,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except _NoAmount:
         await msg.reply_text(
             "🤔 Не нашёл сумму. Напиши, например: «Ресторан Plov 4500 тенге»."
+        )
+    except receipt_analyzer.ModelOverloaded:
+        await msg.reply_text(
+            "⏳ Gemini сейчас перегружен. Повтори через минуту — трата не записана."
         )
     except Exception:
         logger.exception("Ошибка обработки текста")
@@ -903,6 +934,7 @@ def main() -> None:
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.FileExtension("xlsx"), handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
     logger.info("Бот запущен. Ожидаю сообщения...")

@@ -9,7 +9,9 @@ _PATH = os.getenv("SETTINGS_PATH") or os.path.join(os.path.dirname(__file__), "s
 
 # Профиль по умолчанию: все исторические траты лежат на листах «Расходы»/«Итоги».
 DEFAULT_PROFILE = "FDTG tour 2026"
-_DEFAULT_PROFILE_SHEETS = {"data": "Расходы", "summary": "Итоги"}
+# wallet_sheet включён в дефолт, чтобы свежий settings.json (напр. на чистом
+# Railway Volume) совпадал с текущим и кошелёк «Кошелёк» сразу работал.
+_DEFAULT_PROFILE_SHEETS = {"data": "Расходы", "summary": "Итоги", "wallet_sheet": "Кошелёк"}
 _DEFAULTS = {"default_currency": "KZT"}
 
 

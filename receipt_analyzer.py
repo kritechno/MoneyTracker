@@ -22,25 +22,24 @@ _RETRY_BACKOFF = (1.0, 3.0)  # паузы перед повторами; все�
 class ModelOverloaded(Exception):
     """Gemini вернул 429/500/503 после всех повторов — стоит попробовать позже."""
 
-_SYSTEM = f"""Ты — ассистент по учёту трат. На вход поступает фото чека и/или подпись пользователя.
+_SYSTEM = f"""Ты — ассистент по учёту трат. На вход поступает текстовое описание траты от пользователя.
 Определи трату и верни СТРОГО один JSON-объект без пояснений и markdown.
 
 Поля:
-- "date": дата траты в формате YYYY-MM-DD. Бери из чека, если её нет — используй переданную сегодняшнюю дату.
+- "date": дата траты в формате YYYY-MM-DD. Если в тексте даты нет — используй переданную сегодняшнюю дату.
 - "description": краткое описание траты на русском.
     * Для ресторана/кафе пиши: Ресторан «Название». Если названия нет — просто: Ресторан.
       НЕ перечисляй блюда — только название заведения.
     * Для заправки: Заправка «Название» (или просто Заправка).
     * Для отеля: Отель «Название» (или просто Отель).
     * Для прочего — короткое осмысленное описание (магазин, такси, и т.п.).
-- "amount": итоговая сумма (число, без валютного знака, итог по чеку).
-- "currency": один из {CURRENCIES}. Определи по символам/тексту чека (₸/тг/тенге=KZT, сом=KGS, $/USD=USD).
+- "amount": сумма траты (число, без валютного знака).
+- "currency": один из {CURRENCIES}. Определи по словам/символам (₸/тг/тенге=KZT, сом=KGS, $/доллар=USD, €/евро=EUR, сум=UZS, сомони=TJS).
     Помни: большие суммы (тысячи и десятки тысяч) для еды/воды/музея — это почти всегда тенге (KZT), а не доллары.
     Если валюту определить невозможно — используй валюту по умолчанию, указанную в сообщении пользователя.
 - "category": один из {CATEGORIES}. Ресторан/кафе/еда -> Питание. Отель/гостиница -> Отель.
     Заправка/топливо -> Бензин. Остальное -> Прочее.
 
-Подпись пользователя имеет приоритет над содержимым чека, если они противоречат.
 Верни только JSON.
 """
 
@@ -82,28 +81,16 @@ def _normalize(data: dict, default_currency: str = "KZT") -> dict:
     }
 
 
-def analyze(
-    image_bytes: bytes | None,
-    media_type: str | None,
-    caption: str | None,
-    default_currency: str = "KZT",
-) -> dict:
+def analyze(text: str | None, default_currency: str = "KZT") -> dict:
     today = date.today().isoformat()
-    user_note = caption.strip() if caption else ""
+    user_note = text.strip() if text else ""
     prompt = (
         f"Сегодняшняя дата: {today}.\n"
         f"Валюта по умолчанию (если не определить иначе): {default_currency}.\n"
-        f"Подпись пользователя: {user_note or '(нет)'}\n"
+        f"Трата от пользователя: {user_note or '(нет)'}\n"
         "Определи трату и верни JSON."
     )
-
-    parts = []
-    if image_bytes:
-        parts.append(
-            types.Part.from_bytes(data=image_bytes, mime_type=media_type or "image/jpeg")
-        )
-    parts.append(types.Part.from_text(text=prompt))
-
+    parts = [types.Part.from_text(text=prompt)]
     response = _generate(parts)
     return _normalize(_extract_json(response.text), default_currency)
 

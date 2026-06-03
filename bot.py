@@ -4,7 +4,13 @@ import os
 import re
 from datetime import date, timedelta
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Update,
+)
 from telegram.constants import ChatAction
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
@@ -18,6 +24,7 @@ from telegram.ext import (
     filters,
 )
 
+import bills
 import currency
 import excel_store
 import receipt_analyzer
@@ -94,10 +101,10 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 START_TEXT = (
     "👋 Привет! Я веду учёт твоих трат.\n\n"
-    "📸 Пришли фото чека — с подписью или без. Я распознаю сумму, валюту, "
-    "дату и категорию, запишу в Excel и пришлю отчёт.\n\n"
-    "✍️ Можно и без фото — просто напиши, например:\n"
+    "✍️ Просто напиши трату, например:\n"
     "«Ресторан Plov 4500 тенге» или «Заправка 30 долларов».\n\n"
+    "📎 К тексту можно приложить фото чека — я его сохраню. Сумму беру из текста, "
+    "например «Ресторан Нават 50000 тенге» + фото.\n\n"
     "Категории: Отель, Питание, Бензин, Прочее.\n"
     "Под каждой тратой — кнопки категории, ✏️ правки суммы/описания и удаления.\n\n"
     "📊 /total — сводка по тратам (можно /total месяц, /total неделя, /total 7).\n"
@@ -113,9 +120,9 @@ START_TEXT = (
 
 HELP_TEXT = (
     "ℹ️ Команды и возможности:\n\n"
-    "📸 Фото чека (с подписью или без) — распознаю сумму, валюту, дату, "
-    "категорию и запишу в таблицу.\n"
-    "✍️ Текст без фото: «Ресторан Plov 4500 тенге», «Заправка 30 долларов».\n"
+    "✍️ Напиши трату текстом: «Ресторан Plov 4500 тенге», «Заправка 30 долларов».\n"
+    "📎 К тексту можно приложить фото чека — я сохраню его. Сумму беру из текста, "
+    "например «Ресторан Нават 50000 тенге» + фото.\n"
     "💱 Обмен валюты: «поменял 67 долларов 5360 сом» — первая сумма та, что "
     "отдаёшь, вторая — та, что получаешь.\n"
     "Под каждой тратой — кнопки категории, ✏️ правки суммы/описания и удаления.\n\n"
@@ -194,11 +201,9 @@ async def _enrich(entry: dict) -> dict:
     return entry
 
 
-async def _process(image_bytes, media_type, caption):
+async def _process(text):
     default_cur = await asyncio.to_thread(settings.get_default_currency)
-    data = await asyncio.to_thread(
-        receipt_analyzer.analyze, image_bytes, media_type, caption, default_cur
-    )
+    data = await asyncio.to_thread(receipt_analyzer.analyze, text, default_cur)
     if not data.get("amount") or data["amount"] <= 0:
         raise _NoAmount
     data["amount_usd"] = await asyncio.to_thread(
@@ -225,6 +230,30 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     with open(EXCEL_PATH, "rb") as f:
         await update.message.reply_document(document=f, filename="expenses.xlsx")
+
+
+async def bills_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Секретная команда: присылает сохранённые фото-чеки (нет в /help и меню)."""
+    files = await asyncio.to_thread(bills.list_bills)
+    if not files:
+        await update.message.reply_text("📂 Чеков пока нет.")
+        return
+    recent = files[-50:]
+    chat_id = update.message.chat_id
+    await update.message.reply_text(
+        f"📂 Сохранённых чеков: {len(files)}"
+        + ("" if len(recent) == len(files) else f" (показываю последние {len(recent)})")
+    )
+    for i in range(0, len(recent), 10):
+        chunk = recent[i : i + 10]
+        media = []
+        for path in chunk:
+            with open(path, "rb") as f:
+                media.append(InputMediaPhoto(f.read(), caption=os.path.basename(path)))
+        try:
+            await context.bot.send_media_group(chat_id, media)
+        except Exception:
+            logger.exception("Не смог отправить чеки")
 
 
 def _currency_keyboard(current: str) -> InlineKeyboardMarkup:
@@ -472,31 +501,64 @@ async def _exchange_reply(msg, pairs) -> None:
     await msg.reply_text(text, reply_markup=kb)
 
 
+async def _record_expense(msg, text, success_note="", no_amount_msg=None) -> None:
+    """Записывает трату по тексту (без распознавания фото). Общий путь для
+    обычного текста и для подписи к приложенному фото-чеку."""
+    await msg.chat.send_action(ChatAction.TYPING)
+    try:
+        entry, expense_id = await _process(text)
+    except _NoAmount:
+        await msg.reply_text(
+            no_amount_msg
+            or "🤔 Не нашёл сумму. Напиши, например: «Ресторан Plov 4500 тенге»."
+        )
+        return
+    except receipt_analyzer.ModelOverloaded:
+        await msg.reply_text(
+            "⏳ Gemini сейчас перегружен. Повтори через минуту — трата не записана."
+        )
+        return
+    except Exception:
+        logger.exception("Ошибка обработки текста")
+        await msg.reply_text(
+            "⚠️ Не понял трату. Напиши, например: «Ресторан Plov 4500 тенге»."
+        )
+        return
+    reply = _format_reply(entry)
+    if success_note:
+        reply += "\n\n" + success_note
+    await msg.reply_text(
+        reply, reply_markup=_expense_keyboard(expense_id, entry["category"])
+    )
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фото больше не распознаётся: сохраняем его в чеки, а трату берём из подписи."""
     msg = update.message
-    await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+    caption = (msg.caption or "").strip()
     try:
         photo = msg.photo[-1]
         tg_file = await photo.get_file()
         image_bytes = bytes(await tg_file.download_as_bytearray())
-        caption = msg.caption
-        entry, expense_id = await _process(image_bytes, "image/jpeg", caption)
-        await msg.reply_text(
-            _format_reply(entry),
-            reply_markup=_expense_keyboard(expense_id, entry["category"]),
-        )
-    except _NoAmount:
-        await msg.reply_text(
-            "🤔 Не разобрал сумму на чеке. Добавь подпись с суммой, например «4500 тенге»."
-        )
-    except receipt_analyzer.ModelOverloaded:
-        await msg.reply_text(
-            "⏳ Gemini сейчас перегружен. Пришли чек ещё раз через минуту — трата не записана."
-        )
+        await asyncio.to_thread(bills.save_bill, image_bytes, caption)
     except Exception:
-        logger.exception("Ошибка обработки фото")
+        logger.exception("Ошибка сохранения чека")
+        await msg.reply_text("⚠️ Не смог сохранить фото-чек. Попробуй ещё раз.")
+        return
+    if caption:
+        await _record_expense(
+            msg,
+            caption,
+            success_note="📎 Фото-чек сохранён.",
+            no_amount_msg=(
+                "📎 Фото сохранил в чеки, но в подписи не нашёл сумму. "
+                "Добавь её, например «Ресторан Нават 50000 тенге»."
+            ),
+        )
+    else:
         await msg.reply_text(
-            "⚠️ Не получилось обработать чек. Попробуй ещё раз или добавь подпись с суммой."
+            "📎 Сохранил фото в чеки. Чтобы записать трату, пришли текст с суммой — "
+            "можно прямо подписью к фото, например «Ресторан Нават 50000 тенге»."
         )
 
 
@@ -632,26 +694,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if len(pairs) >= 2:
             await _exchange_reply(msg, pairs)
             return
-    await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
-    try:
-        entry, expense_id = await _process(None, None, msg.text)
-        await msg.reply_text(
-            _format_reply(entry),
-            reply_markup=_expense_keyboard(expense_id, entry["category"]),
-        )
-    except _NoAmount:
-        await msg.reply_text(
-            "🤔 Не нашёл сумму. Напиши, например: «Ресторан Plov 4500 тенге»."
-        )
-    except receipt_analyzer.ModelOverloaded:
-        await msg.reply_text(
-            "⏳ Gemini сейчас перегружен. Повтори через минуту — трата не записана."
-        )
-    except Exception:
-        logger.exception("Ошибка обработки текста")
-        await msg.reply_text(
-            "⚠️ Не понял трату. Напиши, например: «Ресторан Plov 4500 тенге»."
-        )
+    await _record_expense(msg, msg.text)
 
 
 async def undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -869,6 +912,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("total", total))
     app.add_handler(CommandHandler("excel", excel_cmd))
+    app.add_handler(CommandHandler("bills", bills_cmd))  # секретная, нет в /help и меню
     app.add_handler(CommandHandler("undo", undo))
     app.add_handler(CommandHandler("delete", undo))
     app.add_handler(CommandHandler("currency", currency_cmd))

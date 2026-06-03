@@ -1,6 +1,7 @@
 .env
 expenses.xlsx
 expenses_backup_*.xlsx
+bills/
 settings.json
 settings_backup_*.json
 bot.log

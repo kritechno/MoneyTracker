@@ -3,7 +3,6 @@ import logging
 import os
 import re
 from datetime import date, timedelta
-from io import BytesIO
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -46,10 +45,9 @@ _excel_lock = asyncio.Lock()
 class _NoAmount(Exception):
     """Не удалось определить сумму траты — не записываем мусор."""
 
-# Фразы-действия (реальный обмен, двигают деньги в кошельке) и фразы-справки
-# (только показать курс). Действие применяется, если в тексте две суммы.
+# Фразы-действия для реального обмена (двигают деньги в кошельке).
+# Применяется, если в тексте есть две суммы: первая — что отдаю, вторая — что получаю.
 _ACTION_RE = re.compile(r"(?i)(помен[яе]|обмен[яе]|размен[яе])")
-_REPORT_RE = re.compile(r"(?i)^\s*(конверт|convert|курс)")
 
 
 def _is_allowed(user_id: int) -> bool:
@@ -108,8 +106,8 @@ START_TEXT = (
     "↩️ /undo — удалить последнюю трату.\n"
     "💲 /currency — валюта по умолчанию.\n"
     "🧹 /clear — очистить чат.\n"
-    "💱 Проверка обменника: «конвертация 30 долларов 15000 тенге» "
-    "(отдал → получил) — сравню с рыночным курсом.\n\n"
+    "💱 Обмен валюты: «поменял 67 долларов 5360 сом» "
+    "(первая сумма — что отдаёшь, вторая — что получаешь).\n\n"
     "ℹ️ /help — список всех команд."
 )
 
@@ -118,6 +116,8 @@ HELP_TEXT = (
     "📸 Фото чека (с подписью или без) — распознаю сумму, валюту, дату, "
     "категорию и запишу в таблицу.\n"
     "✍️ Текст без фото: «Ресторан Plov 4500 тенге», «Заправка 30 долларов».\n"
+    "💱 Обмен валюты: «поменял 67 долларов 5360 сом» — первая сумма та, что "
+    "отдаёшь, вторая — та, что получаешь.\n"
     "Под каждой тратой — кнопки категории, ✏️ правки суммы/описания и удаления.\n\n"
     "Команды:\n"
     "/start — приветствие и краткая инструкция\n"
@@ -130,18 +130,14 @@ HELP_TEXT = (
     "/currency — выбрать валюту по умолчанию (KZT/KGS/USD)\n"
     "/profiles — профили учёта: переключить или создать новый\n"
     "/excel — прислать актуальный Excel-файл\n"
-    "/csv — экспорт трат активного профиля в CSV\n"
-    "/clear — очистить чат с ботом\n"
-    "/convert — конвертация/проверка обменника\n\n"
+    "/clear — очистить чат с ботом\n\n"
     "💼 Кошелёк:\n"
     "У каждого профиля свой баланс по валютам. Остаток = пополнения ± обмены − траты.\n"
     "/wallet — показать остаток. /add 5000 USD — пополнить.\n"
-    "«поменял 30 долларов на 15000 тенге» — реальный обмен: спишу 30 USD и добавлю "
-    "15000 KZT в кошелёк (под сообщением — кнопка «Отменить обмен»).\n\n"
-    "💱 Проверка обменника (без движения денег):\n"
-    "«конвертация 30 долларов 15000 тенге» — отдал 30 USD, получил 15000 KZT, "
-    "сравню с рыночным курсом (кнопкой можно списать с кошелька).\n"
-    "«конвертация 30 долларов» — пересчёт одной суммы в другие валюты.\n\n"
+    "«поменял 67 долларов 5360 сом» — реальный обмен. Первая валюта — что отдаёшь, "
+    "вторая — что получаешь: спишу 67 USD и добавлю 5360 KGS в кошелёк, сравню твой "
+    "курс с рыночным и покажу, выгодно или нет (под сообщением — кнопка "
+    "«Отменить обмен»).\n\n"
     "📂 Профили:\n"
     "/profiles — переключение между профилями учёта (например «FDTG tour 2026», "
     "«Личное»). У каждого профиля свой лист в Excel; траты пишутся в активный "
@@ -229,18 +225,6 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     with open(EXCEL_PATH, "rb") as f:
         await update.message.reply_document(document=f, filename="expenses.xlsx")
-
-
-async def csv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    data = await asyncio.to_thread(excel_store.profile_csv)
-    if not data:
-        await update.message.reply_text("Пока нет трат для экспорта.")
-        return
-    profile = await asyncio.to_thread(settings.get_active_profile)
-    safe = re.sub(r"[^\w.-]+", "_", profile) or "expenses"
-    await update.message.reply_document(
-        document=BytesIO(data), filename=f"{safe}.csv"
-    )
 
 
 def _currency_keyboard(current: str) -> InlineKeyboardMarkup:
@@ -463,61 +447,29 @@ def _format_exchange(gave, received) -> str:
     return "\n".join(lines)
 
 
-def _format_single(amount, cur) -> str:
-    label = CURRENCY_LABELS.get(cur, cur)
-    lines = [f"💱 {amount:,.2f} {cur} ({label}) по рынку:", ""]
-    for other in CURRENCIES:
-        if other != cur:
-            val = currency.convert(amount, cur, other)
-            lines.append(f"  • ≈ {val:,.2f} {other} ({CURRENCY_LABELS.get(other, other)})")
-    return "\n".join(lines)
-
-
 def _ex_cb(tag: str, gave, received) -> str:
     g_amt, g_cur = gave
     r_amt, r_cur = received
     return f"{tag}|{g_cur}|{_fmt_amt(g_amt)}|{r_cur}|{_fmt_amt(r_amt)}"
 
 
-async def _currency_reply(msg, apply_now: bool, pairs=None) -> None:
-    if pairs is None:
-        pairs = await asyncio.to_thread(currency.parse_amounts, msg.text)
-    if not pairs:
-        await msg.reply_text(
-            "Не нашёл сумм. Примеры:\n"
-            "• «поменял 30 долларов на 15000 тенге» — записать обмен в кошелёк\n"
-            "• «конвертация 30 долларов 15000 тенге» — проверить курс обменника\n"
-            "• «конвертация 30 долларов» — пересчёт по рынку"
-        )
-        return
-    if len(pairs) == 1:
-        await msg.reply_text(_format_single(*pairs[0]))
-        return
-
+async def _exchange_reply(msg, pairs) -> None:
+    """Реальный обмен валюты: первая сумма — что отдаю, вторая — что получаю.
+    Списывает отданную, зачисляет полученную, показывает выгоду и кнопку отмены."""
     gave, received = pairs[0], pairs[1]
     g_amt, g_cur = gave
     r_amt, r_cur = received
     text = _format_exchange(gave, received)
-
-    if apply_now:
-        async with _excel_lock:
-            net = await asyncio.to_thread(
-                excel_store.add_exchange, g_cur, g_amt, r_cur, r_amt
-            )
-            t = await asyncio.to_thread(excel_store.compute_totals)
-        text += "\n\n✅ Записал в кошелёк:\n" + _format_wallet(net, t["per_currency"])
-        kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("↩️ Отменить обмен", callback_data=_ex_cb("exun", gave, received))]]
+    async with _excel_lock:
+        net = await asyncio.to_thread(
+            excel_store.add_exchange, g_cur, g_amt, r_cur, r_amt
         )
-    else:
-        kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("💼 Списать с кошелька", callback_data=_ex_cb("exap", gave, received))]]
-        )
+        t = await asyncio.to_thread(excel_store.compute_totals)
+    text += "\n\n✅ Записал в кошелёк:\n" + _format_wallet(net, t["per_currency"])
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("↩️ Отменить обмен", callback_data=_ex_cb("exun", gave, received))]]
+    )
     await msg.reply_text(text, reply_markup=kb)
-
-
-async def convert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _currency_reply(update.message, apply_now=False)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -674,15 +626,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if context.user_data.get("awaiting_wallet_for"):
         await _start_balance_flow(update, context)
         return
-    # Справка по курсу: «конвертация…», «курс…»
-    if _REPORT_RE.search(text):
-        await _currency_reply(msg, apply_now=False)
-        return
     # Реальный обмен: глагол действия + минимум две суммы → двигаем кошелёк.
     if _ACTION_RE.search(text):
         pairs = await asyncio.to_thread(currency.parse_amounts, text)
         if len(pairs) >= 2:
-            await _currency_reply(msg, apply_now=True, pairs=pairs)
+            await _exchange_reply(msg, pairs)
             return
     await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
     try:
@@ -899,9 +847,7 @@ _BOT_COMMANDS = [
     BotCommand("add", "Пополнить кошелёк (/add 5000 USD)"),
     BotCommand("currency", "Валюта по умолчанию"),
     BotCommand("profiles", "Профили учёта (свой лист у каждого)"),
-    BotCommand("convert", "Конвертация / обменник"),
     BotCommand("excel", "Прислать Excel-файл"),
-    BotCommand("csv", "Экспорт трат в CSV"),
     BotCommand("undo", "Удалить последнюю трату"),
     BotCommand("clear", "Очистить чат"),
 ]
@@ -922,9 +868,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("total", total))
-    app.add_handler(CommandHandler("convert", convert))
     app.add_handler(CommandHandler("excel", excel_cmd))
-    app.add_handler(CommandHandler("csv", csv_cmd))
     app.add_handler(CommandHandler("undo", undo))
     app.add_handler(CommandHandler("delete", undo))
     app.add_handler(CommandHandler("currency", currency_cmd))

@@ -17,11 +17,14 @@ ALLOWED_USER_IDS = {
 }
 
 # Поддерживаемые валюты и категории
-CURRENCIES = ["KZT", "KGS", "USD"]
+CURRENCIES = ["KZT", "KGS", "USD", "EUR", "UZS", "TJS"]
 CURRENCY_LABELS = {
     "KZT": "Тенге",
     "KGS": "Сом",
     "USD": "Доллар",
+    "EUR": "Евро",
+    "UZS": "Сум",
+    "TJS": "Сомони",
 }
 CATEGORIES = ["Отель", "Питание", "Бензин", "Прочее"]
 

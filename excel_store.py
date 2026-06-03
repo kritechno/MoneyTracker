@@ -1,4 +1,3 @@
-import csv
 import io
 import os
 import re
@@ -444,33 +443,6 @@ def delete_expense(expense_id: int) -> dict | None:
     _rebuild_summary(wb, data_sheet, summary_sheet, wallet_sheet)
     _atomic_save(wb)
     return entry
-
-
-def profile_csv() -> bytes | None:
-    """CSV активного профиля (UTF-8 с BOM, чтобы Excel читал кириллицу)."""
-    if not os.path.exists(EXCEL_PATH):
-        return None
-    data_sheet, _ = _active_sheets()
-    wb = load_workbook(EXCEL_PATH, data_only=True)
-    if data_sheet not in wb.sheetnames:
-        return None
-    ws = wb[data_sheet]
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(_HEADERS[:6])  # без технического ID
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if row[2] is None and row[5] is None:
-            continue
-        d = _coerce_date(row[0])
-        writer.writerow([
-            d.isoformat() if d else (row[0] or ""),
-            row[1] or "",
-            row[2] if row[2] is not None else "",
-            row[3] or "",
-            row[4] or "",
-            row[5] if row[5] is not None else "",
-        ])
-    return ("﻿" + buf.getvalue()).encode("utf-8")
 
 
 def _safe_sheet_name(base: str, existing: set[str], prefix: str = "") -> str:

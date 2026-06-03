@@ -10,7 +10,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 EXCEL_PATH = os.getenv("EXCEL_PATH", "expenses.xlsx").strip()
 # Папка для приложенных к тратам фото-чеков. По умолчанию рядом с Excel-файлом
-# (на Railway это том /data, чтобы чеки переживали редеплой).
+# или в BILLS_DIR, если нужно хранить чеки на отдельном постоянном диске.
 BILLS_DIR = (
     os.getenv("BILLS_DIR", "").strip()
     or os.path.join(os.path.dirname(EXCEL_PATH) or ".", "bills")

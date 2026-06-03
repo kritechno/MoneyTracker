@@ -3,14 +3,14 @@ import os
 
 from config import CURRENCIES
 
-# Путь к settings.json. На Railway указывает на persistent Volume (SETTINGS_PATH),
-# иначе настройки/владелец/профили сотрутся при каждом редеплое. Локально — рядом с кодом.
+# Путь к settings.json. SETTINGS_PATH можно направить на постоянное хранилище,
+# если бот запускается не с локального диска. Локально — рядом с кодом.
 _PATH = os.getenv("SETTINGS_PATH") or os.path.join(os.path.dirname(__file__), "settings.json")
 
 # Профиль по умолчанию: все исторические траты лежат на листах «Расходы»/«Итоги».
 DEFAULT_PROFILE = "FDTG tour 2026"
-# wallet_sheet включён в дефолт, чтобы свежий settings.json (напр. на чистом
-# Railway Volume) совпадал с текущим и кошелёк «Кошелёк» сразу работал.
+# wallet_sheet включён в дефолт, чтобы свежий settings.json совпадал с текущей
+# структурой Excel и кошелёк «Кошелёк» сразу работал.
 _DEFAULT_PROFILE_SHEETS = {"data": "Расходы", "summary": "Итоги", "wallet_sheet": "Кошелёк"}
 _DEFAULTS = {"default_currency": "KZT"}
 

@@ -55,8 +55,10 @@ _CURRENCY_WORDS = [
 ]
 
 
-def _match_currency(token: str) -> str | None:
-    token = token.lower()
+def match_currency(token: str | None) -> str | None:
+    if not token:
+        return None
+    token = token.lower().strip()
     for code, words in _CURRENCY_WORDS:
         for w in words:
             if token.startswith(w) or token == w:
@@ -75,7 +77,7 @@ def parse_amounts(text: str) -> list[tuple[float, str]]:
         num = _normalize_number(raw_num)
         if num is None:
             continue
-        cur = _match_currency(raw_cur) if raw_cur else None
+        cur = match_currency(raw_cur)
         if cur is None:
             continue
         results.append((num, cur))
@@ -91,13 +93,19 @@ def parse_single_amount(text: str) -> tuple[float, str | None] | None:
     num = _normalize_number(m.group(1))
     if num is None:
         return None
-    cur = _match_currency(m.group(2)) if m.group(2) else None
+    cur = match_currency(m.group(2))
     return num, cur
 
 
-def _normalize_number(raw: str) -> float | None:
+def normalize_number(raw: str) -> float | None:
     raw = raw.strip()
-    if "." in raw and "," not in raw:
+    if "," in raw and "." not in raw and " " not in raw:
+        head, tail = raw.rsplit(",", 1)
+        if len(tail) in (1, 2):
+            cleaned = f"{head}.{tail}"
+        else:
+            cleaned = raw.replace(",", "")
+    elif "." in raw and "," not in raw:
         cleaned = raw.replace(" ", "")
     else:
         cleaned = raw.replace(" ", "").replace(",", "")
@@ -105,6 +113,9 @@ def _normalize_number(raw: str) -> float | None:
         return float(cleaned)
     except ValueError:
         return None
+
+
+_normalize_number = normalize_number
 
 
 def to_usd(amount: float, currency: str) -> float:

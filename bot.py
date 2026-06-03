@@ -12,7 +12,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
-from telegram.error import NetworkError, TimedOut
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -26,6 +26,7 @@ from telegram.ext import (
 
 import bills
 import currency
+import expense_parser
 import excel_store
 import receipt_analyzer
 import settings
@@ -100,55 +101,40 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 START_TEXT = (
-    "👋 Привет! Я веду учёт твоих трат.\n\n"
-    "✍️ Просто напиши трату, например:\n"
-    "«Ресторан Plov 4500 тенге» или «Заправка 30 долларов».\n\n"
-    "📎 К тексту можно приложить фото чека — я его сохраню. Сумму беру из текста, "
-    "например «Ресторан Нават 50000 тенге» + фото.\n\n"
-    "Категории: Отель, Питание, Бензин, Прочее.\n"
-    "Под каждой тратой — кнопки категории, ✏️ правки суммы/описания и удаления.\n\n"
-    "📊 /total — сводка по тратам (можно /total месяц, /total неделя, /total 7).\n"
-    "💼 /wallet — остаток денег в кошельке. /add 5000 USD — пополнить.\n"
-    "📂 /profiles — профили (например «Личное», «Тур») — у каждого свой лист и кошелёк.\n"
-    "↩️ /undo — удалить последнюю трату.\n"
-    "💲 /currency — валюта по умолчанию.\n"
-    "🧹 /clear — очистить чат.\n"
-    "💱 Обмен валюты: «поменял 67 долларов 5360 сом» "
-    "(первая сумма — что отдаёшь, вторая — что получаешь).\n\n"
-    "ℹ️ /help — список всех команд."
+    "👋 Я записываю траты в Excel.\n\n"
+    "Напиши одной строкой:\n"
+    "• Ресторан Plov 4500 тенге\n"
+    "• Такси 1200\n"
+    "• Заправка 30 долларов\n\n"
+    "Фото чека можно приложить с подписью: «Ресторан Нават 50000 тенге». "
+    "Фото сохраню, трату запишу по подписи. Фото без подписи только сохраню.\n\n"
+    "После записи можно кнопками поменять категорию, сумму, описание или удалить трату.\n\n"
+    "Главное:\n"
+    "/total — сводка\n"
+    "/wallet — остаток кошелька\n"
+    "/add 5000 USD — пополнить кошелёк\n"
+    "/profiles — профили учёта\n"
+    "/help — все команды"
 )
 
 HELP_TEXT = (
-    "ℹ️ Команды и возможности:\n\n"
-    "✍️ Напиши трату текстом: «Ресторан Plov 4500 тенге», «Заправка 30 долларов».\n"
-    "📎 К тексту можно приложить фото чека — я сохраню его. Сумму беру из текста, "
-    "например «Ресторан Нават 50000 тенге» + фото.\n"
-    "💱 Обмен валюты: «поменял 67 долларов 5360 сом» — первая сумма та, что "
-    "отдаёшь, вторая — та, что получаешь.\n"
-    "Под каждой тратой — кнопки категории, ✏️ правки суммы/описания и удаления.\n\n"
+    "ℹ️ Как пользоваться\n\n"
+    "Записать трату:\n"
+    "• Ресторан Plov 4500 тенге\n"
+    "• Такси 1200\n"
+    "• Заправка 30 долларов\n\n"
+    "Фото чека: добавь подпись с суммой. Без подписи фото только сохранится в чеки.\n"
+    "Обмен валюты: «поменял 67 долларов 5360 сом».\n\n"
     "Команды:\n"
-    "/start — приветствие и краткая инструкция\n"
-    "/help — этот список\n"
-    "/total — сводка: суммы по валютам, всего в USD, по категориям + остаток.\n"
-    "    Период: /total сегодня · неделя · месяц · год · /total 7 (за N дней)\n"
-    "/wallet — кошелёк: остаток по каждой валюте\n"
-    "/add — пополнить кошелёк: /add 5000 USD\n"
-    "/undo (или /delete) — удалить последнюю трату\n"
-    "/currency — выбрать валюту по умолчанию (KZT/KGS/USD)\n"
-    "/profiles — профили учёта: переключить или создать новый\n"
-    "/excel — прислать актуальный Excel-файл\n"
-    "/clear — очистить чат с ботом\n\n"
-    "💼 Кошелёк:\n"
-    "У каждого профиля свой баланс по валютам. Остаток = пополнения ± обмены − траты.\n"
-    "/wallet — показать остаток. /add 5000 USD — пополнить.\n"
-    "«поменял 67 долларов 5360 сом» — реальный обмен. Первая валюта — что отдаёшь, "
-    "вторая — что получаешь: спишу 67 USD и добавлю 5360 KGS в кошелёк, сравню твой "
-    "курс с рыночным и покажу, выгодно или нет (под сообщением — кнопка "
-    "«Отменить обмен»).\n\n"
-    "📂 Профили:\n"
-    "/profiles — переключение между профилями учёта (например «FDTG tour 2026», "
-    "«Личное»). У каждого профиля свой лист в Excel; траты пишутся в активный "
-    "профиль. Там же можно создать новый профиль.\n\n"
+    "/total — сводка за всё время\n"
+    "/total месяц — период: сегодня, неделя, месяц, год или число дней\n"
+    "/wallet — остаток кошелька\n"
+    "/add 5000 USD — пополнить кошелёк\n"
+    "/profiles — переключить или создать профиль\n"
+    "/currency — валюта по умолчанию\n"
+    "/excel — получить Excel-файл\n"
+    "/undo — удалить последнюю трату\n"
+    "/clear — очистить чат\n\n"
     "Категории: Отель, Питание, Бензин, Прочее."
 )
 
@@ -203,7 +189,13 @@ async def _enrich(entry: dict) -> dict:
 
 async def _process(text):
     default_cur = await asyncio.to_thread(settings.get_default_currency)
-    data = await asyncio.to_thread(receipt_analyzer.analyze, text, default_cur)
+    parsed = await asyncio.to_thread(expense_parser.parse_expense, text, default_cur)
+    if parsed.parsed:
+        data = parsed.entry
+    elif parsed.no_amount:
+        raise _NoAmount
+    else:
+        data = await asyncio.to_thread(receipt_analyzer.analyze, text, default_cur)
     if not data.get("amount") or data["amount"] <= 0:
         raise _NoAmount
     data["amount_usd"] = await asyncio.to_thread(
@@ -258,21 +250,30 @@ async def bills_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _currency_keyboard(current: str) -> InlineKeyboardMarkup:
     buttons = []
+    current = (current or "").upper()
     for cur in CURRENCIES:
         label = CURRENCY_LABELS.get(cur, cur)
         mark = "✅ " if cur == current else ""
         buttons.append(
             InlineKeyboardButton(f"{mark}{label} ({cur})", callback_data=f"setcur|{cur}")
         )
-    return InlineKeyboardMarkup([buttons])
+    return InlineKeyboardMarkup([buttons[i : i + 3] for i in range(0, len(buttons), 3)])
+
+
+def _currency_text(current: str, changed: bool = False) -> str:
+    label = CURRENCY_LABELS.get(current, current)
+    title = "✅ Валюта по умолчанию" if changed else "Валюта по умолчанию"
+    return (
+        f"{title}: {label} ({current}).\n"
+        f"Если в трате нет валюты, запишу сумму как {current}.\n"
+        "Например: «Такси 1200»."
+    )
 
 
 async def currency_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     current = await asyncio.to_thread(settings.get_default_currency)
     await update.message.reply_text(
-        f"Валюта по умолчанию: {CURRENCY_LABELS.get(current, current)} ({current}).\n"
-        "Она используется, когда валюту не удаётся определить по чеку.\n"
-        "Выбери новую:",
+        _currency_text(current) + "\n\nВыбери новую:",
         reply_markup=_currency_keyboard(current),
     )
 
@@ -291,7 +292,7 @@ async def profiles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     names = await asyncio.to_thread(settings.list_profiles)
     await update.message.reply_text(
         f"📂 Активный профиль: {active}\n"
-        "Траты записываются в его лист. Выбери профиль или создай новый:",
+        "Новые траты попадут в этот профиль. Выбери другой или создай новый:",
         reply_markup=_profiles_keyboard(active, names),
     )
 
@@ -338,10 +339,10 @@ def _format_wallet(net: dict, per_currency: dict) -> str:
             shown = True
             negative = negative or bal[cur] < 0
     if not shown:
-        lines.append("  • пусто — пополни через /add 5000 USD")
+        lines.append("  • кошелёк пуст")
     lines.append(f"  💲 Итого ≈ {total_usd:,.2f} USD")
     if negative:
-        lines.append("⚠️ Есть валюты в минусе — пополни кошелёк через /add.")
+        lines.append("⚠️ Есть минус по валюте. Пополнить: /add 5000 USD")
     return "\n".join(lines)
 
 
@@ -502,15 +503,14 @@ async def _exchange_reply(msg, pairs) -> None:
 
 
 async def _record_expense(msg, text, success_note="", no_amount_msg=None) -> None:
-    """Записывает трату по тексту (без распознавания фото). Общий путь для
-    обычного текста и для подписи к приложенному фото-чеку."""
+    """Записывает трату из обычного текста или подписи к фото."""
     await msg.chat.send_action(ChatAction.TYPING)
     try:
         entry, expense_id = await _process(text)
     except _NoAmount:
         await msg.reply_text(
             no_amount_msg
-            or "🤔 Не нашёл сумму. Напиши, например: «Ресторан Plov 4500 тенге»."
+            or "Не вижу сумму. Напиши так: «Ресторан Plov 4500 тенге»."
         )
         return
     except receipt_analyzer.ModelOverloaded:
@@ -521,7 +521,7 @@ async def _record_expense(msg, text, success_note="", no_amount_msg=None) -> Non
     except Exception:
         logger.exception("Ошибка обработки текста")
         await msg.reply_text(
-            "⚠️ Не понял трату. Напиши, например: «Ресторан Plov 4500 тенге»."
+            "⚠️ Не смог разобрать трату. Пример: «Ресторан Plov 4500 тенге»."
         )
         return
     reply = _format_reply(entry)
@@ -533,7 +533,7 @@ async def _record_expense(msg, text, success_note="", no_amount_msg=None) -> Non
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Фото больше не распознаётся: сохраняем его в чеки, а трату берём из подписи."""
+    """Сохраняет фото-чек; трату записывает только из подписи."""
     msg = update.message
     caption = (msg.caption or "").strip()
     try:
@@ -543,28 +543,28 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await asyncio.to_thread(bills.save_bill, image_bytes, caption)
     except Exception:
         logger.exception("Ошибка сохранения чека")
-        await msg.reply_text("⚠️ Не смог сохранить фото-чек. Попробуй ещё раз.")
+        await msg.reply_text("⚠️ Не смог сохранить фото. Пришли его ещё раз.")
         return
     if caption:
         await _record_expense(
             msg,
             caption,
-            success_note="📎 Фото-чек сохранён.",
+            success_note="📎 Фото сохранено в чеки.",
             no_amount_msg=(
-                "📎 Фото сохранил в чеки, но в подписи не нашёл сумму. "
-                "Добавь её, например «Ресторан Нават 50000 тенге»."
+                "📎 Фото сохранено. Чтобы записать трату, добавь сумму в подпись: "
+                "«Ресторан Нават 50000 тенге»."
             ),
         )
     else:
         await msg.reply_text(
-            "📎 Сохранил фото в чеки. Чтобы записать трату, пришли текст с суммой — "
-            "можно прямо подписью к фото, например «Ресторан Нават 50000 тенге»."
+            "📎 Фото сохранено в чеки. Трата не записана: нет подписи с суммой.\n"
+            "В следующий раз подпиши фото так: «Ресторан Нават 50000 тенге»."
         )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Восстановление трат: пользователь шлёт .xlsx → делаем его активным файлом.
-    Нужно для заливки истории на Railway Volume (чистый Volume → отправил файл — готово)."""
+    Полезно после переноса на новое хранилище: отправил файл — история восстановлена."""
     msg = update.message
     await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
     try:
@@ -590,7 +590,7 @@ async def _create_profile_flow(update: Update, context: ContextTypes.DEFAULT_TYP
     name = (msg.text or "").strip()
     context.user_data["awaiting_profile_name"] = False
     if not name:
-        await msg.reply_text("Пустое название. Попробуй ещё раз: /profiles")
+        await msg.reply_text("Название пустое. Создать профиль заново: /profiles")
         return
     if await asyncio.to_thread(settings.profile_exists, name):
         await asyncio.to_thread(settings.set_active_profile, name)
@@ -601,10 +601,10 @@ async def _create_profile_flow(update: Update, context: ContextTypes.DEFAULT_TYP
         await asyncio.to_thread(settings.set_active_profile, name)
     context.user_data["awaiting_wallet_for"] = name
     await msg.reply_text(
-        f"✅ Профиль «{name}» создан и активирован — для него создан отдельный лист "
-        "в Excel. Все новые траты пойдут сюда.\n\n"
-        "💼 Укажи начальный баланс кошелька (например «1460000 тенге 7000 долларов») "
-        "или напиши «-», чтобы пропустить."
+        f"✅ Профиль «{name}» создан и активирован.\n\n"
+        "Начальный баланс кошелька можно указать одним сообщением:\n"
+        "«1460000 тенге 7000 долларов»\n\n"
+        "Чтобы пропустить, напиши «-»."
     )
 
 
@@ -619,7 +619,7 @@ async def _start_balance_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not pairs:
         await msg.reply_text(
             f"Ок, профиль «{name}» без начального баланса. "
-            "Пополнить позже: /add 5000 USD."
+            "Пополнить позже: /add 5000 USD"
         )
         return
     async with _excel_lock:
@@ -653,7 +653,7 @@ async def _apply_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: 
             )
     else:
         if not text:
-            await msg.reply_text("Пустое описание. Пришли текст ещё раз.")
+            await msg.reply_text("Описание пустое. Пришли новый текст одним сообщением.")
             return
         async with _excel_lock:
             entry = await asyncio.to_thread(
@@ -720,17 +720,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     parts = data.split("|")
 
     if parts[0] == "setcur" and len(parts) == 2:
-        cur = parts[1]
+        cur = parts[1].upper()
+        current = await asyncio.to_thread(settings.get_default_currency)
+        if cur == current:
+            await query.answer(f"Уже выбрано: {cur}")
+            return
         ok = await asyncio.to_thread(settings.set_default_currency, cur)
         if not ok:
             await query.answer("Неизвестная валюта.")
             return
-        await query.answer(f"Валюта по умолчанию: {cur}")
-        await query.edit_message_text(
-            f"✅ Валюта по умолчанию: {CURRENCY_LABELS.get(cur, cur)} ({cur}).\n"
-            "Она применяется, когда валюту не удаётся определить по чеку.",
-            reply_markup=_currency_keyboard(cur),
-        )
+        saved = await asyncio.to_thread(settings.get_default_currency)
+        text = _currency_text(saved, changed=True)
+        await query.answer(f"Сохранено: {saved}")
+        try:
+            await query.edit_message_text(text, reply_markup=_currency_keyboard(saved))
+        except BadRequest:
+            await query.message.reply_text(text, reply_markup=_currency_keyboard(saved))
         return
 
     if parts[0] == "prof_new":
@@ -753,7 +758,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer(f"Профиль: {name}")
         await query.edit_message_text(
             f"📂 Активный профиль: {name}\n"
-            "Траты записываются в его лист. Выбери профиль или создай новый:",
+            "Новые траты попадут в этот профиль. Выбери другой или создай новый:",
             reply_markup=_profiles_keyboard(name, names),
         )
         return

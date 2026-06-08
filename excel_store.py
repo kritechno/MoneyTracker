@@ -18,6 +18,8 @@ _DATA_WIDTHS = [12, 34, 12, 10, 14, 12, 8]
 _ID_COL = 7  # технический столбец стабильного идентификатора (скрыт)
 _WALLET_HEADERS = ["Дата", "Тип", "Валюта", "Сумма", "Примечание"]
 _WALLET_WIDTHS = [12, 16, 10, 14, 30]
+_START_KIND = "Старт"  # вид движения «начальный баланс» кошелька
+_START_NOTE = "Начальный баланс"
 _HEADER_FILL = PatternFill("solid", fgColor="4472C4")
 _HEADER_FONT = Font(bold=True, color="FFFFFF")
 _TITLE_FONT = Font(bold=True, size=12)
@@ -69,11 +71,13 @@ def _init_wallet_sheet(ws) -> None:
     ws.freeze_panes = "A2"
 
 
-def _append_movement(ws, kind: str, currency: str, amount: float, note: str = "") -> None:
+def _append_movement(
+    ws, kind: str, currency: str, amount: float, note: str = "", on_date: date | None = None
+) -> None:
     next_row = ws.max_row + 1 if ws.max_row >= 1 else 2
     if next_row < 2:
         next_row = 2
-    d = ws.cell(row=next_row, column=1, value=date.today())
+    d = ws.cell(row=next_row, column=1, value=on_date or date.today())
     d.number_format = "yyyy-mm-dd"
     ws.cell(row=next_row, column=2, value=kind)
     ws.cell(row=next_row, column=3, value=currency)
@@ -168,10 +172,11 @@ def _load() -> Workbook:
             _init_data_sheet(ws)
         if summary_sheet not in wb.sheetnames:
             wb.create_sheet(summary_sheet)
-        if wallet_sheet and wallet_sheet not in wb.sheetnames:
-            _init_wallet_sheet(wb.create_sheet(wallet_sheet))
-        return wb
-    return _new_workbook()
+    else:
+        wb = _new_workbook()
+    if wallet_sheet and wallet_sheet not in wb.sheetnames:
+        _init_wallet_sheet(wb.create_sheet(wallet_sheet))
+    return wb
 
 
 def _parse_date(value: str):
@@ -533,6 +538,54 @@ def add_exchange(
     return _wallet_net_from_ws(ws)
 
 
+def get_start_balance(name: str | None = None) -> dict:
+    """Начальный баланс профиля по валютам — сумма строк «Старт» в кошельке."""
+    result = {cur: 0.0 for cur in CURRENCIES}
+    wallet_sheet = settings.get_wallet_sheet(name)
+    if not wallet_sheet or not os.path.exists(EXCEL_PATH):
+        return result
+    wb = load_workbook(EXCEL_PATH, data_only=True)
+    if wallet_sheet not in wb.sheetnames:
+        return result
+    for row in wb[wallet_sheet].iter_rows(min_row=2, values_only=True):
+        kind, cur, amt = row[1], row[2], row[3]
+        if kind == _START_KIND and cur in result and isinstance(amt, (int, float)):
+            result[cur] += amt
+    return {cur: round(v, 2) for cur, v in result.items()}
+
+
+def set_start_balance(pairs: list[tuple[float, str]]) -> dict:
+    """Переписывает начальный баланс активного профиля: удаляет прежние строки
+    «Старт» и записывает новые. Пополнения и обмены не трогаются. Пустой список
+    обнуляет начальный баланс. Дата прежнего «Старта» сохраняется, чтобы правка
+    не «сдвигала» начальный баланс на сегодня. Возвращает остаток кошелька."""
+    data_sheet, summary_sheet = _active_sheets()
+    wallet_sheet = settings.get_active_wallet_sheet()
+    wb = _load()
+    ws = wb[wallet_sheet]
+
+    start_date = None
+    for row in range(ws.max_row, 1, -1):
+        if ws.cell(row=row, column=2).value == _START_KIND:
+            d = _coerce_date(ws.cell(row=row, column=1).value)
+            if d is not None and (start_date is None or d < start_date):
+                start_date = d
+            ws.delete_rows(row, 1)
+
+    # Складываем одинаковые валюты, чтобы повторные правки не плодили строки.
+    merged: dict[str, float] = {}
+    for amount, cur in pairs:
+        if cur in CURRENCIES:
+            merged[cur] = merged.get(cur, 0.0) + float(amount)
+    for cur in CURRENCIES:
+        if merged.get(cur):
+            _append_movement(ws, _START_KIND, cur, merged[cur], _START_NOTE, start_date)
+
+    _rebuild_summary(wb, data_sheet, summary_sheet, wallet_sheet)
+    _atomic_save(wb)
+    return _wallet_net_from_ws(ws)
+
+
 def ensure_ids_setup() -> None:
     """Миграция: проставляет стабильные ID существующим тратам всех профилей."""
     if not os.path.exists(EXCEL_PATH):
@@ -576,7 +629,7 @@ def ensure_wallet_setup() -> None:
             for cur in CURRENCIES:
                 amt = legacy.get(cur)
                 if isinstance(amt, (int, float)) and amt:
-                    _append_movement(ws, "Старт", cur, amt, "Начальный баланс")
+                    _append_movement(ws, _START_KIND, cur, amt, _START_NOTE)
             settings.clear_legacy_wallet(name)
             changed = True
 

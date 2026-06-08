@@ -130,6 +130,7 @@ HELP_TEXT = (
     "/total месяц — период: сегодня, неделя, месяц, год или число дней\n"
     "/wallet — остаток кошелька\n"
     "/add 5000 USD — пополнить кошелёк\n"
+    "/startbalance — исправить начальный баланс профиля\n"
     "/profiles — переключить или создать профиль\n"
     "/currency — валюта по умолчанию\n"
     "/excel — получить Excel-файл\n"
@@ -346,6 +347,22 @@ def _format_wallet(net: dict, per_currency: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_start_balance(start: dict) -> str:
+    parts = []
+    for cur in CURRENCIES:
+        amt = start.get(cur, 0.0)
+        if amt:
+            label = CURRENCY_LABELS.get(cur, cur)
+            parts.append(f"{amt:,.2f} {cur} ({label})")
+    return ", ".join(parts) if parts else "не задан (0)"
+
+
+def _wallet_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✏️ Исправить начальный баланс", callback_data="setstart")]]
+    )
+
+
 def _fmt_amt(a: float) -> str:
     a = round(float(a), 2)
     return str(int(a)) if a == int(a) else f"{a:.2f}"
@@ -408,7 +425,8 @@ async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"📂 Профиль: {profile}\n\n"
         + _format_wallet(net, t["per_currency"])
         + "\n\n➕ Пополнить: /add 5000 USD\n"
-        "💱 Обмен: «поменял 30 долларов на 15000 тенге»"
+        "💱 Обмен: «поменял 30 долларов на 15000 тенге»",
+        reply_markup=_wallet_keyboard(),
     )
 
 
@@ -624,14 +642,63 @@ async def _start_balance_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     async with _excel_lock:
         await asyncio.to_thread(settings.set_active_profile, name)
-        for amount, cur in pairs:
-            net = await asyncio.to_thread(
-                excel_store.add_movement, "Старт", cur, amount, "Начальный баланс"
-            )
+        net = await asyncio.to_thread(excel_store.set_start_balance, pairs)
+        start = await asyncio.to_thread(excel_store.get_start_balance)
         t = await asyncio.to_thread(excel_store.compute_totals)
-    added = ", ".join(f"{amt:,.2f} {cur}" for amt, cur in pairs)
     await msg.reply_text(
-        f"✅ Начальный баланс профиля «{name}»: {added}\n\n"
+        f"✅ Начальный баланс профиля «{name}»: {_format_start_balance(start)}\n\n"
+        + _format_wallet(net, t["per_currency"])
+        + "\n\nОшибся в сумме? Поправить: /startbalance"
+    )
+
+
+async def _prompt_start_balance(msg, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает текущий начальный баланс активного профиля и ждёт новый."""
+    profile = await asyncio.to_thread(settings.get_active_profile)
+    start = await asyncio.to_thread(excel_store.get_start_balance)
+    context.user_data["awaiting_edit"] = None
+    context.user_data["awaiting_profile_name"] = False
+    context.user_data.pop("awaiting_wallet_for", None)
+    context.user_data["awaiting_start_balance"] = True
+    await msg.reply_text(
+        f"📂 Профиль: {profile}\n"
+        f"Текущий начальный баланс: {_format_start_balance(start)}\n\n"
+        "Пришли правильный начальный баланс одним сообщением:\n"
+        "«1460000 тенге 7000 долларов»\n\n"
+        "«0» — обнулить, «-» — отмена. Пополнения и обмены не трону."
+    )
+
+
+async def start_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _prompt_start_balance(update.message, context)
+
+
+async def _apply_start_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    context.user_data["awaiting_start_balance"] = False
+    text = (msg.text or "").strip()
+    low = text.lower()
+    if low in {"-", "отмена", "нет", "cancel", "пропустить", "skip"}:
+        await msg.reply_text("Ок, начальный баланс не меняю.")
+        return
+    if low in {"0", "ноль", "пусто"}:
+        pairs = []
+    else:
+        pairs = await asyncio.to_thread(currency.parse_amounts, text)
+        if not pairs:
+            context.user_data["awaiting_start_balance"] = True  # дать повторить ввод
+            await msg.reply_text(
+                "Не понял сумму. Пример: «1460000 тенге 7000 долларов».\n"
+                "«0» — обнулить, «-» — отмена."
+            )
+            return
+    async with _excel_lock:
+        net = await asyncio.to_thread(excel_store.set_start_balance, pairs)
+        start = await asyncio.to_thread(excel_store.get_start_balance)
+        t = await asyncio.to_thread(excel_store.compute_totals)
+    profile = await asyncio.to_thread(settings.get_active_profile)
+    await msg.reply_text(
+        f"✅ Начальный баланс профиля «{profile}»: {_format_start_balance(start)}\n\n"
         + _format_wallet(net, t["per_currency"])
     )
 
@@ -687,6 +754,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if context.user_data.get("awaiting_wallet_for"):
         await _start_balance_flow(update, context)
+        return
+    if context.user_data.get("awaiting_start_balance"):
+        await _apply_start_balance(update, context)
         return
     # Реальный обмен: глагол действия + минимум две суммы → двигаем кошелёк.
     if _ACTION_RE.search(text):
@@ -745,6 +815,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "📂 Пришли название нового профиля одним сообщением "
             "(например «Личное» или «Тур 2027»)."
         )
+        return
+
+    if parts[0] == "setstart":
+        await query.answer()
+        await _prompt_start_balance(query.message, context)
         return
 
     if parts[0] == "prof" and len(parts) == 2:
@@ -893,6 +968,7 @@ _BOT_COMMANDS = [
     BotCommand("total", "Сводка по тратам"),
     BotCommand("wallet", "Кошелёк: остаток по валютам"),
     BotCommand("add", "Пополнить кошелёк (/add 5000 USD)"),
+    BotCommand("startbalance", "Исправить начальный баланс кошелька"),
     BotCommand("currency", "Валюта по умолчанию"),
     BotCommand("profiles", "Профили учёта (свой лист у каждого)"),
     BotCommand("excel", "Прислать Excel-файл"),
@@ -924,6 +1000,7 @@ def main() -> None:
     app.add_handler(CommandHandler("profiles", profiles_cmd))
     app.add_handler(CommandHandler("wallet", wallet_cmd))
     app.add_handler(CommandHandler("add", add_cmd))
+    app.add_handler(CommandHandler("startbalance", start_balance_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))

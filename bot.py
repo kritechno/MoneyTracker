@@ -59,16 +59,30 @@ _ACTION_RE = re.compile(r"(?i)(помен[яе]|обмен[яе]|размен[я
 
 
 def _is_allowed(user_id: int) -> bool:
-    """Доступ только владельцу. Если ALLOWED_USER_IDS задан — по нему; иначе
-    первый написавший «занимает» бота (auto-claim) и становится владельцем."""
+    """Пускаем владельца и список из .env, плюс тех, кому владелец выдал доступ
+    командой /allow. Если ALLOWED_USER_IDS пуст и владельца ещё нет — первый
+    написавший «занимает» бота (auto-claim) и становится владельцем."""
+    if ALLOWED_USER_IDS:
+        if user_id in ALLOWED_USER_IDS:
+            return True
+    else:
+        owner = settings.get_owner_id()
+        if owner is None:
+            settings.set_owner_id(user_id)
+            logger.info("Владелец бота назначен: %s", user_id)
+            return True
+        if user_id == owner:
+            return True
+    return user_id in settings.get_allowed_user_ids()
+
+
+def _is_admin(user_id: int) -> bool:
+    """Управлять доступом (/allow, /disallow, /allowed) может владелец, а в
+    режиме ALLOWED_USER_IDS — любой из этого списка. Гостям, добавленным через
+    /allow, управление недоступно."""
     if ALLOWED_USER_IDS:
         return user_id in ALLOWED_USER_IDS
-    owner = settings.get_owner_id()
-    if owner is None:
-        settings.set_owner_id(user_id)
-        logger.info("Владелец бота назначен: %s", user_id)
-        return True
-    return user_id == owner
+    return user_id == settings.get_owner_id()
 
 
 async def _auth_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -81,7 +95,10 @@ async def _auth_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if update.callback_query:
         await update.callback_query.answer("⛔️ Это личный бот.", show_alert=True)
     elif update.effective_message:
-        await update.effective_message.reply_text("⛔️ Это личный бот учёта трат.")
+        await update.effective_message.reply_text(
+            "⛔️ Это личный бот учёта трат.\n"
+            f"Твой ID: {user.id} — покажи его владельцу, чтобы он открыл доступ."
+        )
     raise ApplicationHandlerStop
 
 
@@ -130,7 +147,6 @@ HELP_TEXT = (
     "/total месяц — период: сегодня, неделя, месяц, год или число дней\n"
     "/wallet — остаток кошелька\n"
     "/add 5000 USD — пополнить кошелёк\n"
-    "/startbalance — исправить начальный баланс профиля\n"
     "/profiles — переключить или создать профиль\n"
     "/currency — валюта по умолчанию\n"
     "/excel — получить Excel-файл\n"
@@ -226,7 +242,11 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def bills_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Секретная команда: присылает сохранённые фото-чеки (нет в /help и меню)."""
+    """Только владельцу: присылает сохранённые фото-чеки (нет в /help и меню)."""
+    user = update.effective_user
+    if user is None or not await asyncio.to_thread(_is_admin, user.id):
+        await update.message.reply_text("⛔️ Чеки доступны только владельцу бота.")
+        return
     files = await asyncio.to_thread(bills.list_bills)
     if not files:
         await update.message.reply_text("📂 Чеков пока нет.")
@@ -962,13 +982,108 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await query.answer()
 
 
+def _parse_user_ids(args) -> list[int]:
+    """Достаёт положительные Telegram-id из аргументов команды (через пробел)."""
+    ids: list[int] = []
+    for tok in args or []:
+        tok = tok.strip().lstrip("@")
+        if tok.isdigit():
+            uid = int(tok)
+            if uid not in ids:
+                ids.append(uid)
+    return ids
+
+
+async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Владелец открывает доступ другим пользователям по Telegram-id."""
+    msg = update.message
+    user = update.effective_user
+    if user is None or not await asyncio.to_thread(_is_admin, user.id):
+        await msg.reply_text("⛔️ Управлять доступом может только владелец бота.")
+        return
+    ids = _parse_user_ids(context.args)
+    if not ids:
+        await msg.reply_text(
+            "Кому открыть доступ? Пришли Telegram-id:\n"
+            "• /allow 123456789\n"
+            "• /allow 123456789 987654321\n\n"
+            "Свой id новый пользователь увидит, просто написав боту."
+        )
+        return
+    added, already = [], []
+    for uid in ids:
+        if await asyncio.to_thread(settings.add_allowed_user_id, uid):
+            added.append(uid)
+        else:
+            already.append(uid)
+    lines = []
+    if added:
+        lines.append("✅ Доступ открыт: " + ", ".join(map(str, added)))
+    if already:
+        lines.append("ℹ️ Уже был доступ: " + ", ".join(map(str, already)))
+    await msg.reply_text("\n".join(lines))
+
+
+async def disallow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Владелец закрывает доступ. Себя и список из .env снять нельзя."""
+    msg = update.message
+    user = update.effective_user
+    if user is None or not await asyncio.to_thread(_is_admin, user.id):
+        await msg.reply_text("⛔️ Управлять доступом может только владелец бота.")
+        return
+    ids = _parse_user_ids(context.args)
+    if not ids:
+        await msg.reply_text("Кого убрать? Пример: /disallow 123456789")
+        return
+    owner = await asyncio.to_thread(settings.get_owner_id)
+    removed, missing, protected = [], [], []
+    for uid in ids:
+        if uid in ALLOWED_USER_IDS or uid == owner:
+            protected.append(uid)
+        elif await asyncio.to_thread(settings.remove_allowed_user_id, uid):
+            removed.append(uid)
+        else:
+            missing.append(uid)
+    lines = []
+    if removed:
+        lines.append("✅ Доступ закрыт: " + ", ".join(map(str, removed)))
+    if missing:
+        lines.append("ℹ️ Не было в списке: " + ", ".join(map(str, missing)))
+    if protected:
+        lines.append(
+            "⛔️ Нельзя убрать здесь (владелец или из .env): "
+            + ", ".join(map(str, protected))
+        )
+    await msg.reply_text("\n".join(lines))
+
+
+async def allowed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает, у кого сейчас есть доступ к боту."""
+    msg = update.message
+    user = update.effective_user
+    if user is None or not await asyncio.to_thread(_is_admin, user.id):
+        await msg.reply_text("⛔️ Список доступа видит только владелец бота.")
+        return
+    owner = await asyncio.to_thread(settings.get_owner_id)
+    granted = sorted(await asyncio.to_thread(settings.get_allowed_user_ids))
+    lines = ["👥 Доступ к боту:"]
+    if ALLOWED_USER_IDS:
+        lines.append("• из .env: " + ", ".join(map(str, sorted(ALLOWED_USER_IDS))))
+    if owner is not None:
+        lines.append(f"• владелец: {owner}")
+    if granted:
+        lines.append("• выдан через /allow: " + ", ".join(map(str, granted)))
+    lines.append("")
+    lines.append("Добавить: /allow <id> · убрать: /disallow <id>")
+    await msg.reply_text("\n".join(lines))
+
+
 _BOT_COMMANDS = [
     BotCommand("start", "Старт и инструкция"),
     BotCommand("help", "Все команды"),
     BotCommand("total", "Сводка по тратам"),
     BotCommand("wallet", "Кошелёк: остаток по валютам"),
     BotCommand("add", "Пополнить кошелёк (/add 5000 USD)"),
-    BotCommand("startbalance", "Исправить начальный баланс кошелька"),
     BotCommand("currency", "Валюта по умолчанию"),
     BotCommand("profiles", "Профили учёта (свой лист у каждого)"),
     BotCommand("excel", "Прислать Excel-файл"),
@@ -1001,6 +1116,9 @@ def main() -> None:
     app.add_handler(CommandHandler("wallet", wallet_cmd))
     app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("startbalance", start_balance_cmd))
+    app.add_handler(CommandHandler("allow", allow_cmd))
+    app.add_handler(CommandHandler("disallow", disallow_cmd))
+    app.add_handler(CommandHandler("allowed", allowed_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))

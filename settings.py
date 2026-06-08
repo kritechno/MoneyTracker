@@ -52,6 +52,52 @@ def set_owner_id(user_id: int) -> None:
     _save(data)
 
 
+# --- Доп. список доступа ----------------------------------------------------
+# Владелец может выдать доступ другим пользователям командой /allow, не трогая
+# .env и не передеплоивая. Эти id хранятся здесь, в settings.json, и работают
+# вдобавок к владельцу и списку ALLOWED_USER_IDS из .env.
+
+
+def _stored_allowed_ids(data: dict) -> list[int]:
+    out: list[int] = []
+    for x in data.get("allowed_user_ids", []) or []:
+        try:
+            uid = int(x)
+        except (TypeError, ValueError):
+            continue
+        if uid not in out:
+            out.append(uid)
+    return out
+
+
+def get_allowed_user_ids() -> set[int]:
+    """Telegram-id, которым владелец выдал доступ через /allow."""
+    return set(_stored_allowed_ids(_load()))
+
+
+def add_allowed_user_id(user_id: int) -> bool:
+    """Добавляет id в список доступа. False — если он там уже был."""
+    data = _load()
+    ids = _stored_allowed_ids(data)
+    if int(user_id) in ids:
+        return False
+    ids.append(int(user_id))
+    data["allowed_user_ids"] = ids
+    _save(data)
+    return True
+
+
+def remove_allowed_user_id(user_id: int) -> bool:
+    """Убирает id из списка доступа. False — если его там не было."""
+    data = _load()
+    ids = _stored_allowed_ids(data)
+    if int(user_id) not in ids:
+        return False
+    data["allowed_user_ids"] = [x for x in ids if x != int(user_id)]
+    _save(data)
+    return True
+
+
 def get_default_currency() -> str:
     return _load().get("default_currency", "KZT")
 

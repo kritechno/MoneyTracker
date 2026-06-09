@@ -35,7 +35,6 @@ from config import (
     CATEGORIES,
     CURRENCIES,
     CURRENCY_LABELS,
-    EXCEL_PATH,
     TELEGRAM_BOT_TOKEN,
 )
 
@@ -118,19 +117,20 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 START_TEXT = (
-    "👋 Я записываю траты в Excel.\n\n"
-    "Напиши одной строкой:\n"
-    "• Ресторан Plov 4500 тенге\n"
+    "👋 Я веду учёт трат по турам.\n\n"
+    "Записать трату — просто напиши строкой:\n"
+    "• Ресторан Нават 50000 тенге\n"
     "• Такси 1200\n"
     "• Заправка 30 долларов\n\n"
-    "Фото чека можно приложить с подписью: «Ресторан Нават 50000 тенге». "
-    "Фото сохраню, трату запишу по подписи. Фото без подписи только сохраню.\n\n"
-    "После записи можно кнопками поменять категорию, сумму, описание или удалить трату.\n\n"
+    "Фото чека приложи с подписью «Ресторан Нават 50000 тенге» — фото сохраню, "
+    "трату запишу по подписи.\n\n"
+    "После записи кнопками меняешь категорию, сумму, описание или удаляешь трату.\n\n"
     "Главное:\n"
-    "/total — сводка\n"
+    "/total — сводка по туру\n"
     "/wallet — остаток кошелька\n"
     "/add 5000 USD — пополнить кошелёк\n"
-    "/profiles — профили учёта\n"
+    "/profiles — выбрать или создать тур\n"
+    "/excel — выгрузить файл тура\n"
     "/help — все команды"
 )
 
@@ -143,13 +143,13 @@ HELP_TEXT = (
     "Фото чека: добавь подпись с суммой. Без подписи фото только сохранится в чеки.\n"
     "Обмен валюты: «поменял 67 долларов 5360 сом».\n\n"
     "Команды:\n"
-    "/total — сводка за всё время\n"
+    "/total — сводка по туру за всё время\n"
     "/total месяц — период: сегодня, неделя, месяц, год или число дней\n"
     "/wallet — остаток кошелька\n"
     "/add 5000 USD — пополнить кошелёк\n"
-    "/profiles — переключить или создать профиль\n"
+    "/profiles — выбрать или создать тур\n"
     "/currency — валюта по умолчанию\n"
-    "/excel — получить Excel-файл\n"
+    "/excel — выгрузить файл тура\n"
     "/undo — удалить последнюю трату\n"
     "/clear — очистить чат\n\n"
     "Категории: Отель, Питание, Бензин, Прочее."
@@ -173,7 +173,7 @@ def _format_reply(entry: dict) -> str:
         if entry["remaining"] < 0:
             lines.append(f"⚠️ Кошелёк в минусе по {cur} — пополни через /add.")
     if entry.get("profile"):
-        lines.append(f"📂 Профиль: {entry['profile']}")
+        lines.append(f"📂 Тур: {entry['profile']}")
     return "\n".join(lines)
 
 
@@ -234,11 +234,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not os.path.exists(EXCEL_PATH):
-        await update.message.reply_text("Таблица пока пуста — нет ни одной траты.")
+    path = await asyncio.to_thread(excel_store.active_path)
+    profile = await asyncio.to_thread(settings.get_active_profile)
+    if not os.path.exists(path):
+        await update.message.reply_text("Тур пока пустой — нет ни одной траты.")
         return
-    with open(EXCEL_PATH, "rb") as f:
-        await update.message.reply_document(document=f, filename="expenses.xlsx")
+    with open(path, "rb") as f:
+        await update.message.reply_document(document=f, filename=f"{profile}.xlsx")
 
 
 async def bills_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -304,7 +306,7 @@ def _profiles_keyboard(active: str, names: list[str]) -> InlineKeyboardMarkup:
     for i, name in enumerate(names):
         mark = "✅ " if name == active else ""
         rows.append([InlineKeyboardButton(f"{mark}{name}", callback_data=f"prof|{i}")])
-    rows.append([InlineKeyboardButton("➕ Новый профиль", callback_data="prof_new")])
+    rows.append([InlineKeyboardButton("➕ Новый тур", callback_data="prof_new")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -312,8 +314,8 @@ async def profiles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     active = await asyncio.to_thread(settings.get_active_profile)
     names = await asyncio.to_thread(settings.list_profiles)
     await update.message.reply_text(
-        f"📂 Активный профиль: {active}\n"
-        "Новые траты попадут в этот профиль. Выбери другой или создай новый:",
+        f"📂 Активный тур: {active}\n"
+        "Новые траты попадут в этот тур. Выбери другой или создай новый:",
         reply_markup=_profiles_keyboard(active, names),
     )
 
@@ -410,7 +412,7 @@ def _parse_period(args: list[str]) -> tuple[date | None, str]:
 
 def _format_total(t: dict, profile: str, period: str = "за всё время") -> str:
     if t["count"] == 0:
-        return f"📊 Профиль «{profile}» · {period}: трат нет."
+        return f"📊 Тур «{profile}» · {period}: трат нет."
     lines = [f"📊 Сводка · {profile} · {period} ({t['count']} трат):", "", "💱 По валютам:"]
     for cur in CURRENCIES:
         amount = t["per_currency"].get(cur, 0.0)
@@ -442,7 +444,7 @@ async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     net = await asyncio.to_thread(excel_store.wallet_net)
     t = await asyncio.to_thread(excel_store.compute_totals)
     await update.message.reply_text(
-        f"📂 Профиль: {profile}\n\n"
+        f"📂 Тур: {profile}\n\n"
         + _format_wallet(net, t["per_currency"])
         + "\n\n➕ Пополнить: /add 5000 USD\n"
         "💱 Обмен: «поменял 30 долларов на 15000 тенге»",
@@ -601,25 +603,27 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Восстановление трат: пользователь шлёт .xlsx → делаем его активным файлом.
-    Полезно после переноса на новое хранилище: отправил файл — история восстановлена."""
+    """Импорт тура: пользователь шлёт .xlsx → имя файла становится названием тура.
+    Новый тур создаётся, существующий заменяется (с бэкапом), тур делается активным."""
     msg = update.message
     await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
     try:
         tg_file = await msg.document.get_file()
         data = bytes(await tg_file.download_as_bytearray())
         async with _excel_lock:
-            sheets = await asyncio.to_thread(excel_store.restore_workbook, data)
+            name, replaced = await asyncio.to_thread(
+                excel_store.import_profile_from_upload, msg.document.file_name, data
+            )
     except Exception:
-        logger.exception("Ошибка восстановления файла")
+        logger.exception("Ошибка импорта файла тура")
         await msg.reply_text(
-            "⚠️ Не смог прочитать файл — он повреждён или это не .xlsx, выгруженный из бота."
+            "⚠️ Не смог прочитать файл — он повреждён или это не .xlsx."
         )
         return
+    verb = "обновил из файла" if replaced else "создал из файла"
     await msg.reply_text(
-        "✅ Файл трат восстановлен.\nЛисты: "
-        + ", ".join(sheets)
-        + "\nПрежний файл сохранён в бэкап."
+        f"✅ Тур «{name}» {verb} и сделал активным.\n"
+        "Новые траты пойдут в него. Переключить тур: /profiles."
     )
 
 
@@ -628,18 +632,18 @@ async def _create_profile_flow(update: Update, context: ContextTypes.DEFAULT_TYP
     name = (msg.text or "").strip()
     context.user_data["awaiting_profile_name"] = False
     if not name:
-        await msg.reply_text("Название пустое. Создать профиль заново: /profiles")
+        await msg.reply_text("Название пустое. Создать тур заново: /profiles")
         return
     if await asyncio.to_thread(settings.profile_exists, name):
         await asyncio.to_thread(settings.set_active_profile, name)
-        await msg.reply_text(f"📂 Профиль «{name}» уже есть — сделал его активным.")
+        await msg.reply_text(f"📂 Тур «{name}» уже есть — сделал его активным.")
         return
     async with _excel_lock:
         await asyncio.to_thread(excel_store.create_profile, name)
         await asyncio.to_thread(settings.set_active_profile, name)
     context.user_data["awaiting_wallet_for"] = name
     await msg.reply_text(
-        f"✅ Профиль «{name}» создан и активирован.\n\n"
+        f"✅ Тур «{name}» создан (отдельный файл) и активирован.\n\n"
         "Начальный баланс кошелька можно указать одним сообщением:\n"
         "«1460000 тенге 7000 долларов»\n\n"
         "Чтобы пропустить, напиши «-»."
@@ -656,7 +660,7 @@ async def _start_balance_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
     pairs = [] if skip else await asyncio.to_thread(currency.parse_amounts, text)
     if not pairs:
         await msg.reply_text(
-            f"Ок, профиль «{name}» без начального баланса. "
+            f"Ок, тур «{name}» без начального баланса. "
             "Пополнить позже: /add 5000 USD"
         )
         return
@@ -666,7 +670,7 @@ async def _start_balance_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         start = await asyncio.to_thread(excel_store.get_start_balance)
         t = await asyncio.to_thread(excel_store.compute_totals)
     await msg.reply_text(
-        f"✅ Начальный баланс профиля «{name}»: {_format_start_balance(start)}\n\n"
+        f"✅ Начальный баланс тура «{name}»: {_format_start_balance(start)}\n\n"
         + _format_wallet(net, t["per_currency"])
         + "\n\nОшибся в сумме? Поправить: /startbalance"
     )
@@ -681,7 +685,7 @@ async def _prompt_start_balance(msg, context: ContextTypes.DEFAULT_TYPE) -> None
     context.user_data.pop("awaiting_wallet_for", None)
     context.user_data["awaiting_start_balance"] = True
     await msg.reply_text(
-        f"📂 Профиль: {profile}\n"
+        f"📂 Тур: {profile}\n"
         f"Текущий начальный баланс: {_format_start_balance(start)}\n\n"
         "Пришли правильный начальный баланс одним сообщением:\n"
         "«1460000 тенге 7000 долларов»\n\n"
@@ -718,7 +722,7 @@ async def _apply_start_balance(update: Update, context: ContextTypes.DEFAULT_TYP
         t = await asyncio.to_thread(excel_store.compute_totals)
     profile = await asyncio.to_thread(settings.get_active_profile)
     await msg.reply_text(
-        f"✅ Начальный баланс профиля «{profile}»: {_format_start_balance(start)}\n\n"
+        f"✅ Начальный баланс тура «{profile}»: {_format_start_balance(start)}\n\n"
         + _format_wallet(net, t["per_currency"])
     )
 
@@ -832,8 +836,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data["awaiting_profile_name"] = True
         await query.answer()
         await query.message.reply_text(
-            "📂 Пришли название нового профиля одним сообщением "
-            "(например «Личное» или «Тур 2027»)."
+            "📂 Пришли название нового тура одним сообщением "
+            "(например «Италия 2026» или «Тур 2027»)."
         )
         return
 
@@ -847,13 +851,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             name = names[int(parts[1])]
         except (ValueError, IndexError):
-            await query.answer("Профиль не найден.")
+            await query.answer("Тур не найден.")
             return
         await asyncio.to_thread(settings.set_active_profile, name)
-        await query.answer(f"Профиль: {name}")
+        await query.answer(f"Тур: {name}")
         await query.edit_message_text(
-            f"📂 Активный профиль: {name}\n"
-            "Новые траты попадут в этот профиль. Выбери другой или создай новый:",
+            f"📂 Активный тур: {name}\n"
+            "Новые траты попадут в этот тур. Выбери другой или создай новый:",
             reply_markup=_profiles_keyboard(name, names),
         )
         return
@@ -1085,8 +1089,8 @@ _BOT_COMMANDS = [
     BotCommand("wallet", "Кошелёк: остаток по валютам"),
     BotCommand("add", "Пополнить кошелёк (/add 5000 USD)"),
     BotCommand("currency", "Валюта по умолчанию"),
-    BotCommand("profiles", "Профили учёта (свой лист у каждого)"),
-    BotCommand("excel", "Прислать Excel-файл"),
+    BotCommand("profiles", "Туры: у каждого свой файл"),
+    BotCommand("excel", "Выгрузить файл тура"),
     BotCommand("undo", "Удалить последнюю трату"),
     BotCommand("clear", "Очистить чат"),
 ]
@@ -1094,6 +1098,7 @@ _BOT_COMMANDS = [
 
 async def _post_init(app: Application) -> None:
     await asyncio.to_thread(settings.ensure_defaults)
+    await asyncio.to_thread(excel_store.migrate_to_files)
     await asyncio.to_thread(excel_store.ensure_ids_setup)
     await asyncio.to_thread(excel_store.ensure_wallet_setup)
     await app.bot.set_my_commands(_BOT_COMMANDS)

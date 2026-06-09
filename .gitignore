@@ -1,11 +1,14 @@
 .env
-expenses.xlsx
-expenses_backup_*.xlsx
+# Учётные данные туров — отдельный .xlsx на тур (имя файла = имя тура), плюс
+# временные/бэкап-файлы. Личные финансовые данные не должны попадать в репозиторий.
+*.xlsx
+.expenses_*.xlsx
+.tour_*.xlsx
 bills/
 settings.json
 settings_backup_*.json
 bot.log
-.expenses_*.xlsx
+.DS_Store
 __pycache__/
 *.pyc
 venv/

@@ -9,6 +9,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 EXCEL_PATH = os.getenv("EXCEL_PATH", "expenses.xlsx").strip()
+# Папка с файлами туров: на каждый тур (профиль) — свой .xlsx, имя = название тура.
+# По умолчанию рядом с EXCEL_PATH (на Railway это том /data). Имя активного файла
+# хранится в settings.json. EXCEL_PATH остаётся как (а) источник для разовой миграции
+# со старой однофайловой схемы и (б) основа имени файла тура по умолчанию.
+DATA_DIR = os.path.dirname(os.path.abspath(EXCEL_PATH)) or "."
 # Папка для приложенных к тратам фото-чеков. По умолчанию рядом с Excel-файлом
 # или в BILLS_DIR, если нужно хранить чеки на отдельном постоянном диске.
 BILLS_DIR = (

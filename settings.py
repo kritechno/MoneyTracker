@@ -7,19 +7,17 @@ from config import CURRENCIES
 # если бот запускается не с локального диска. Локально — рядом с кодом.
 _PATH = os.getenv("SETTINGS_PATH") or os.path.join(os.path.dirname(__file__), "settings.json")
 
-# Профиль по умолчанию: все исторические траты лежат на листах «Расходы»/«Итоги».
+# Тур (профиль) по умолчанию. Каждый тур — отдельный .xlsx-файл, имя файла = имя тура.
 DEFAULT_PROFILE = "FDTG tour 2026"
-# wallet_sheet включён в дефолт, чтобы свежий settings.json совпадал с текущей
-# структурой Excel и кошелёк «Кошелёк» сразу работал.
-_DEFAULT_PROFILE_SHEETS = {"data": "Расходы", "summary": "Итоги", "wallet_sheet": "Кошелёк"}
+_DEFAULT_PROFILE = {"file": f"{DEFAULT_PROFILE}.xlsx"}
 _DEFAULTS = {"default_currency": "KZT"}
 
 
 def _ensure_profiles(data: dict) -> dict:
-    """Гарантирует наличие профиля по умолчанию и активного профиля."""
+    """Гарантирует наличие тура по умолчанию и активного тура."""
     profiles = data.get("profiles")
     if not isinstance(profiles, dict) or not profiles:
-        data["profiles"] = {DEFAULT_PROFILE: dict(_DEFAULT_PROFILE_SHEETS)}
+        data["profiles"] = {DEFAULT_PROFILE: dict(_DEFAULT_PROFILE)}
     if data.get("active_profile") not in data["profiles"]:
         data["active_profile"] = next(iter(data["profiles"]))
     return data
@@ -128,10 +126,30 @@ def get_active_profile() -> str:
     return _load()["active_profile"]
 
 
-def get_active_sheets() -> tuple[str, str]:
+def get_active_file() -> str:
+    """Имя .xlsx-файла активного тура (без папки)."""
     data = _load()
-    sheets = data["profiles"][data["active_profile"]]
-    return sheets["data"], sheets["summary"]
+    prof = data["profiles"][data["active_profile"]]
+    file = prof.get("file") if isinstance(prof, dict) else None
+    # Подстраховка на случай старой записи до миграции excel_store.migrate_to_files.
+    return file or f"{data['active_profile']}.xlsx"
+
+
+def get_profile_file(name: str | None = None) -> str | None:
+    """Имя файла указанного тура (или активного, если name=None)."""
+    data = _load()
+    name = name or data["active_profile"]
+    prof = data["profiles"].get(name)
+    return prof.get("file") if isinstance(prof, dict) else None
+
+
+def set_profile_file(name: str, file: str) -> bool:
+    data = _load()
+    if name not in data["profiles"]:
+        return False
+    data["profiles"][name]["file"] = file
+    _save(data)
+    return True
 
 
 def profile_exists(name: str) -> bool:
@@ -149,44 +167,22 @@ def set_active_profile(name: str) -> bool:
 
 
 def all_profiles() -> dict:
-    """Полная карта профилей: name -> {data, summary, wallet_sheet?, wallet?}."""
+    """Полная карта туров: name -> {file} (или старое {data, summary, wallet_sheet}
+    до миграции excel_store.migrate_to_files)."""
     return _load()["profiles"]
 
 
-def register_profile(
-    name: str, data_sheet: str, summary_sheet: str, wallet_sheet: str
-) -> None:
+def register_profile(name: str, file: str) -> None:
+    """Записывает тур как {file}. Перетирает старую запись (листы) при миграции."""
     data = _load()
-    data["profiles"][name.strip()] = {
-        "data": data_sheet,
-        "summary": summary_sheet,
-        "wallet_sheet": wallet_sheet,
-    }
+    data["profiles"][name.strip()] = {"file": file}
     _save(data)
 
 
 # --- Кошелёк ----------------------------------------------------------------
-# Источник истины — лист «Кошелёк» в Excel (см. excel_store). Здесь хранится
-# только имя этого листа. Остаток считается как поступления/обмены − траты.
-
-
-def get_wallet_sheet(name: str | None = None) -> str | None:
-    data = _load()
-    name = name or data["active_profile"]
-    return data["profiles"].get(name, {}).get("wallet_sheet")
-
-
-def get_active_wallet_sheet() -> str | None:
-    return get_wallet_sheet()
-
-
-def set_wallet_sheet(name: str, wallet_sheet: str) -> bool:
-    data = _load()
-    if name not in data["profiles"]:
-        return False
-    data["profiles"][name]["wallet_sheet"] = wallet_sheet
-    _save(data)
-    return True
+# Источник истины по остатку — лист «Кошелёк» в файле тура (см. excel_store).
+# Ниже — только хелперы разовой миграции совсем старого формата кошелька, когда
+# остаток лежал словарём прямо в settings.json.
 
 
 def get_legacy_wallet(name: str) -> dict | None:

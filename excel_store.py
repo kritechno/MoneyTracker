@@ -11,7 +11,13 @@ from openpyxl.utils import get_column_letter
 
 import currency
 import settings
-from config import CATEGORIES, CURRENCIES, CURRENCY_LABELS, EXCEL_PATH
+from config import CATEGORIES, CURRENCIES, CURRENCY_LABELS, DATA_DIR, EXCEL_PATH
+
+# Имена листов одинаковы во всех файлах: каждый тур — отдельный .xlsx, поэтому
+# уникальность имён листов между турами больше не нужна.
+DATA_SHEET = "Расходы"
+SUMMARY_SHEET = "Итоги"
+WALLET_SHEET = "Кошелёк"
 
 _HEADERS = ["Дата", "Описание", "Сумма", "Валюта", "Категория", "Сумма USD", "ID"]
 _DATA_WIDTHS = [12, 34, 12, 10, 14, 12, 8]
@@ -23,41 +29,62 @@ _START_NOTE = "Начальный баланс"
 _HEADER_FILL = PatternFill("solid", fgColor="4472C4")
 _HEADER_FONT = Font(bold=True, color="FFFFFF")
 _TITLE_FONT = Font(bold=True, size=12)
-_INVALID_SHEET_CHARS = re.compile(r"[\[\]:*?/\\]")
+# Символы, недопустимые в имени файла (Windows/Unix) + управляющие.
+_INVALID_FILE_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
-def _active_sheets() -> tuple[str, str]:
-    return settings.get_active_sheets()
+# --- Пути к файлам туров ----------------------------------------------------
 
 
-def _atomic_save(wb: Workbook) -> None:
+def _active_path() -> str:
+    return os.path.join(DATA_DIR, settings.get_active_file())
+
+
+def active_path() -> str:
+    """Публичный путь к файлу активного тура (для выгрузки /excel)."""
+    return _active_path()
+
+
+def _path_for(name: str | None = None) -> str | None:
+    """Путь к файлу тура по имени (или активного, если name=None)."""
+    file = settings.get_active_file() if name is None else settings.get_profile_file(name)
+    return os.path.join(DATA_DIR, file) if file else None
+
+
+def _safe_filename(name: str, existing: set[str] | None = None) -> str:
+    """Имя .xlsx-файла из названия тура: без запрещённых символов, уникальное в DATA_DIR."""
+    cleaned = _INVALID_FILE_CHARS.sub(" ", name or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(". ")
+    cleaned = (cleaned[:80].strip() or "Тур")
+    if existing is None:
+        existing = (
+            {f.lower() for f in os.listdir(DATA_DIR)} if os.path.isdir(DATA_DIR) else set()
+        )
+    candidate = f"{cleaned}.xlsx"
+    n = 2
+    while candidate.lower() in existing:
+        candidate = f"{cleaned} {n}.xlsx"
+        n += 1
+    return candidate
+
+
+def _atomic_save(wb: Workbook, path: str) -> None:
     """Сохраняет книгу через временный файл + os.replace, чтобы аварийное
     завершение (сон Мака, перезапуск) не оставило битый .xlsx."""
-    folder = os.path.dirname(os.path.abspath(EXCEL_PATH))
-    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".expenses_", suffix=".xlsx")
+    folder = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".tour_", suffix=".xlsx")
     os.close(fd)
     try:
         wb.save(tmp)
-        os.replace(tmp, EXCEL_PATH)
+        os.replace(tmp, path)
     except Exception:
         if os.path.exists(tmp):
             os.remove(tmp)
         raise
 
 
-def restore_workbook(data: bytes) -> list[str]:
-    """Проверяет загруженный .xlsx и делает его активным файлом трат.
-    Текущий файл сначала бэкапится. Используется для восстановления истории:
-    пользователь шлёт expenses.xlsx документом в чат.
-    Возвращает список листов восстановленной книги; бросает исключение,
-    если файл не открывается как .xlsx."""
-    wb = load_workbook(io.BytesIO(data))  # битый/не-xlsx → исключение, файл не тронут
-    if os.path.exists(EXCEL_PATH):
-        folder = os.path.dirname(os.path.abspath(EXCEL_PATH))
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        shutil.copy2(EXCEL_PATH, os.path.join(folder, f"expenses_backup_restore_{stamp}.xlsx"))
-    _atomic_save(wb)
-    return wb.sheetnames
+# --- Построение листов ------------------------------------------------------
 
 
 def _init_wallet_sheet(ws) -> None:
@@ -69,6 +96,45 @@ def _init_wallet_sheet(ws) -> None:
     for i, w in enumerate(_WALLET_WIDTHS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
+
+
+def _init_data_sheet(ws) -> None:
+    for col, header in enumerate(_HEADERS, start=1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+        cell.alignment = Alignment(horizontal="center")
+    for i, w in enumerate(_DATA_WIDTHS, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.column_dimensions[get_column_letter(_ID_COL)].hidden = True
+    ws.freeze_panes = "A2"
+
+
+def _new_workbook() -> Workbook:
+    """Свежий файл тура: листы Расходы / Итоги / Кошелёк."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = DATA_SHEET
+    _init_data_sheet(ws)
+    wb.create_sheet(SUMMARY_SHEET)
+    _init_wallet_sheet(wb.create_sheet(WALLET_SHEET))
+    return wb
+
+
+def _load(path: str) -> Workbook:
+    """Открывает файл тура, добавляя недостающие стандартные листы. Если файла нет —
+    создаёт новую книгу (на диск пишет только вызывающий через _atomic_save)."""
+    if os.path.exists(path):
+        wb = load_workbook(path)
+        if DATA_SHEET not in wb.sheetnames:
+            _init_data_sheet(wb.create_sheet(DATA_SHEET))
+        if SUMMARY_SHEET not in wb.sheetnames:
+            wb.create_sheet(SUMMARY_SHEET)
+        if WALLET_SHEET not in wb.sheetnames:
+            _init_wallet_sheet(wb.create_sheet(WALLET_SHEET))
+    else:
+        wb = _new_workbook()
+    return wb
 
 
 def _append_movement(
@@ -93,24 +159,6 @@ def _wallet_net_from_ws(ws) -> dict:
         if cur in net and isinstance(amt, (int, float)):
             net[cur] += amt
     return {cur: round(v, 2) for cur, v in net.items()}
-
-
-def _gen_wallet_name(name: str, existing: set[str]) -> str:
-    if name == settings.DEFAULT_PROFILE and "Кошелёк" not in existing:
-        return "Кошелёк"
-    return _safe_sheet_name(name, existing, prefix="Кошелёк ")
-
-
-def _init_data_sheet(ws) -> None:
-    for col, header in enumerate(_HEADERS, start=1):
-        cell = ws.cell(row=1, column=col, value=header)
-        cell.fill = _HEADER_FILL
-        cell.font = _HEADER_FONT
-        cell.alignment = Alignment(horizontal="center")
-    for i, w in enumerate(_DATA_WIDTHS, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    ws.column_dimensions[get_column_letter(_ID_COL)].hidden = True
-    ws.freeze_panes = "A2"
 
 
 def _next_id(ws) -> int:
@@ -150,33 +198,6 @@ def _ensure_ids(ws) -> bool:
             nxt += 1
             changed = True
     return changed
-
-
-def _new_workbook() -> Workbook:
-    data_sheet, summary_sheet = _active_sheets()
-    wb = Workbook()
-    ws = wb.active
-    ws.title = data_sheet
-    _init_data_sheet(ws)
-    wb.create_sheet(summary_sheet)
-    return wb
-
-
-def _load() -> Workbook:
-    data_sheet, summary_sheet = _active_sheets()
-    wallet_sheet = settings.get_active_wallet_sheet()
-    if os.path.exists(EXCEL_PATH):
-        wb = load_workbook(EXCEL_PATH)
-        if data_sheet not in wb.sheetnames:
-            ws = wb.create_sheet(data_sheet)
-            _init_data_sheet(ws)
-        if summary_sheet not in wb.sheetnames:
-            wb.create_sheet(summary_sheet)
-    else:
-        wb = _new_workbook()
-    if wallet_sheet and wallet_sheet not in wb.sheetnames:
-        _init_wallet_sheet(wb.create_sheet(wallet_sheet))
-    return wb
 
 
 def _parse_date(value: str):
@@ -281,31 +302,29 @@ def _rebuild_summary(
 
 
 def compute_totals(since: date | None = None) -> dict:
-    """Считает итоги по активному профилю: суммы по валютам, общую в USD
-    и суммы по категориям (в USD). since — нижняя граница даты включительно."""
+    """Считает итоги по активному туру: суммы по валютам, общую в USD и суммы по
+    категориям (в USD). since — нижняя граница даты включительно."""
     empty = {
         "per_currency": {cur: 0.0 for cur in CURRENCIES},
         "per_category": {cat: 0.0 for cat in CATEGORIES},
         "total_usd": 0.0,
         "count": 0,
     }
-    data_sheet, _ = _active_sheets()
-
-    if not os.path.exists(EXCEL_PATH):
+    path = _active_path()
+    if not os.path.exists(path):
         return empty
-
-    wb = load_workbook(EXCEL_PATH, data_only=True)
-    if data_sheet not in wb.sheetnames:
+    wb = load_workbook(path, data_only=True)
+    if DATA_SHEET not in wb.sheetnames:
         return empty
-    return _aggregate(wb[data_sheet], since)
+    return _aggregate(wb[DATA_SHEET], since)
 
 
 def add_expense(entry: dict) -> int:
     """entry: {date, description, amount, currency, category, amount_usd}.
-    Пишет в лист активного профиля, возвращает стабильный id траты."""
-    data_sheet, summary_sheet = _active_sheets()
-    wb = _load()
-    ws = wb[data_sheet]
+    Пишет в файл активного тура, возвращает стабильный id траты."""
+    path = _active_path()
+    wb = _load(path)
+    ws = wb[DATA_SHEET]
     _ensure_ids(ws)
     next_row = ws.max_row + 1 if ws.max_row >= 1 else 2
     if next_row < 2:
@@ -323,9 +342,8 @@ def add_expense(entry: dict) -> int:
     usd.number_format = "#,##0.00"
     ws.cell(row=next_row, column=_ID_COL, value=expense_id)
 
-    wallet_sheet = settings.get_active_wallet_sheet()
-    _rebuild_summary(wb, data_sheet, summary_sheet, wallet_sheet)
-    _atomic_save(wb)
+    _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+    _atomic_save(wb, path)
     return expense_id
 
 
@@ -347,26 +365,26 @@ def _row_to_entry(ws, row: int) -> dict | None:
 
 
 def get_expense(expense_id: int) -> dict | None:
-    if not os.path.exists(EXCEL_PATH):
+    path = _active_path()
+    if not os.path.exists(path):
         return None
-    data_sheet, _ = _active_sheets()
-    wb = load_workbook(EXCEL_PATH)
-    if data_sheet not in wb.sheetnames:
+    wb = load_workbook(path)
+    if DATA_SHEET not in wb.sheetnames:
         return None
-    ws = wb[data_sheet]
+    ws = wb[DATA_SHEET]
     row = _find_row_by_id(ws, expense_id)
     return _row_to_entry(ws, row) if row else None
 
 
 def last_entry() -> dict | None:
-    """Последняя добавленная трата активного профиля (для /undo), либо None."""
-    if not os.path.exists(EXCEL_PATH):
+    """Последняя добавленная трата активного тура (для /undo), либо None."""
+    path = _active_path()
+    if not os.path.exists(path):
         return None
-    data_sheet, _ = _active_sheets()
-    wb = load_workbook(EXCEL_PATH)
-    if data_sheet not in wb.sheetnames:
+    wb = load_workbook(path)
+    if DATA_SHEET not in wb.sheetnames:
         return None
-    ws = wb[data_sheet]
+    ws = wb[DATA_SHEET]
     for row in range(ws.max_row, 1, -1):
         if ws.cell(row=row, column=3).value is not None:
             return _row_to_entry(ws, row)
@@ -375,18 +393,17 @@ def last_entry() -> dict | None:
 
 def update_category(expense_id: int, category: str) -> dict | None:
     """Меняет категорию траты по стабильному id."""
-    data_sheet, summary_sheet = _active_sheets()
-    wb = _load()
-    ws = wb[data_sheet]
+    path = _active_path()
+    wb = _load(path)
+    ws = wb[DATA_SHEET]
     row = _find_row_by_id(ws, expense_id)
     entry = _row_to_entry(ws, row) if row else None
     if entry is None:
         return None
     ws.cell(row=row, column=5, value=category)
     entry["category"] = category
-    wallet_sheet = settings.get_active_wallet_sheet()
-    _rebuild_summary(wb, data_sheet, summary_sheet, wallet_sheet)
-    _atomic_save(wb)
+    _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+    _atomic_save(wb, path)
     return entry
 
 
@@ -394,9 +411,9 @@ def update_amount(
     expense_id: int, amount: float, cur: str | None = None
 ) -> dict | None:
     """Меняет сумму (и при желании валюту) траты по id, пересчитывает USD."""
-    data_sheet, summary_sheet = _active_sheets()
-    wb = _load()
-    ws = wb[data_sheet]
+    path = _active_path()
+    wb = _load(path)
+    ws = wb[DATA_SHEET]
     row = _find_row_by_id(ws, expense_id)
     entry = _row_to_entry(ws, row) if row else None
     if entry is None:
@@ -410,17 +427,16 @@ def update_amount(
     ws.cell(row=row, column=4, value=new_cur)
     ws.cell(row=row, column=6, value=usd).number_format = "#,##0.00"
     entry.update(amount=amount, currency=new_cur, amount_usd=usd)
-    wallet_sheet = settings.get_active_wallet_sheet()
-    _rebuild_summary(wb, data_sheet, summary_sheet, wallet_sheet)
-    _atomic_save(wb)
+    _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+    _atomic_save(wb, path)
     return entry
 
 
 def update_description(expense_id: int, description: str) -> dict | None:
     """Меняет описание траты по id."""
-    data_sheet, summary_sheet = _active_sheets()
-    wb = _load()
-    ws = wb[data_sheet]
+    path = _active_path()
+    wb = _load(path)
+    ws = wb[DATA_SHEET]
     row = _find_row_by_id(ws, expense_id)
     entry = _row_to_entry(ws, row) if row else None
     if entry is None:
@@ -428,65 +444,82 @@ def update_description(expense_id: int, description: str) -> dict | None:
     description = (description or "").strip() or entry["description"]
     ws.cell(row=row, column=2, value=description)
     entry["description"] = description
-    wallet_sheet = settings.get_active_wallet_sheet()
-    _rebuild_summary(wb, data_sheet, summary_sheet, wallet_sheet)
-    _atomic_save(wb)
+    _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+    _atomic_save(wb, path)
     return entry
 
 
 def delete_expense(expense_id: int) -> dict | None:
     """Удаляет трату по стабильному id (id остальных строк не меняются)."""
-    data_sheet, summary_sheet = _active_sheets()
-    wb = _load()
-    ws = wb[data_sheet]
+    path = _active_path()
+    wb = _load(path)
+    ws = wb[DATA_SHEET]
     row = _find_row_by_id(ws, expense_id)
     entry = _row_to_entry(ws, row) if row else None
     if entry is None:
         return None
     ws.delete_rows(row, 1)
-    wallet_sheet = settings.get_active_wallet_sheet()
-    _rebuild_summary(wb, data_sheet, summary_sheet, wallet_sheet)
-    _atomic_save(wb)
+    _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+    _atomic_save(wb, path)
     return entry
 
 
-def _safe_sheet_name(base: str, existing: set[str], prefix: str = "") -> str:
-    """Корректное имя листа Excel (<=31 симв., без запрещённых символов, уникальное)."""
-    cleaned = _INVALID_SHEET_CHARS.sub(" ", base).strip() or "Профиль"
-    candidate = (prefix + cleaned)[:31].strip()
-    n = 2
-    while candidate in existing or not candidate:
-        suffix = f" {n}"
-        candidate = (prefix + cleaned)[: 31 - len(suffix)].strip() + suffix
-        n += 1
-    return candidate
+# --- Туры (профили) ---------------------------------------------------------
 
 
 def create_profile(name: str) -> dict:
-    """Создаёт новый профиль: листы данных/итогов/кошелька и запись в настройках."""
+    """Создаёт новый тур: отдельный .xlsx-файл с листами Расходы/Итоги/Кошелёк
+    и запись в настройках."""
     name = name.strip()
-    wb = _load()
-    existing = set(wb.sheetnames)
-    data_sheet = _safe_sheet_name(name, existing)
-    existing.add(data_sheet)
-    summary_sheet = _safe_sheet_name(name, existing, prefix="Итоги ")
-    existing.add(summary_sheet)
-    wallet_sheet = _gen_wallet_name(name, existing)
-    existing.add(wallet_sheet)
+    filename = _safe_filename(name)
+    path = os.path.join(DATA_DIR, filename)
+    wb = _new_workbook()
+    _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+    _atomic_save(wb, path)
+    settings.register_profile(name, filename)
+    return {"name": name, "file": filename}
 
-    _init_data_sheet(wb.create_sheet(data_sheet))
-    wb.create_sheet(summary_sheet)
-    _init_wallet_sheet(wb.create_sheet(wallet_sheet))
-    _rebuild_summary(wb, data_sheet, summary_sheet, wallet_sheet)
-    _atomic_save(wb)
 
-    settings.register_profile(name, data_sheet, summary_sheet, wallet_sheet)
-    return {
-        "name": name,
-        "data": data_sheet,
-        "summary": summary_sheet,
-        "wallet": wallet_sheet,
-    }
+def _normalize_imported(wb: Workbook) -> None:
+    """Приводит присланную книгу к структуре файла тура: первый лист считаем
+    расходами, гарантируем Итоги/Кошелёк и стабильные id."""
+    if DATA_SHEET not in wb.sheetnames:
+        wb[wb.sheetnames[0]].title = DATA_SHEET
+    _ensure_ids(wb[DATA_SHEET])
+    if SUMMARY_SHEET not in wb.sheetnames:
+        wb.create_sheet(SUMMARY_SHEET)
+    if WALLET_SHEET not in wb.sheetnames:
+        _init_wallet_sheet(wb.create_sheet(WALLET_SHEET))
+
+
+def import_profile_from_upload(filename: str, data: bytes) -> tuple[str, bool]:
+    """Импорт тура из присланного .xlsx. Имя файла → название тура: создаёт новый
+    тур или заменяет файл существующего (с бэкапом), делает его активным.
+    Возвращает (имя тура, replaced). Бросает исключение, если это не .xlsx."""
+    wb = load_workbook(io.BytesIO(data))  # битый/не-xlsx → исключение
+    stem = os.path.splitext(os.path.basename(filename or ""))[0]
+    stem = re.sub(r"\s+", " ", _INVALID_FILE_CHARS.sub(" ", stem)).strip()
+    name = stem or "Импортированный тур"
+
+    _normalize_imported(wb)
+
+    replaced = settings.profile_exists(name)
+    if replaced:
+        target = settings.get_profile_file(name) or _safe_filename(name)
+        path = os.path.join(DATA_DIR, target)
+        if os.path.exists(path):
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = os.path.splitext(target)[0]
+            shutil.copy2(path, os.path.join(DATA_DIR, f"{base}_backup_{stamp}.xlsx"))
+    else:
+        target = _safe_filename(name)
+        path = os.path.join(DATA_DIR, target)
+
+    _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+    _atomic_save(wb, path)
+    settings.register_profile(name, target)
+    settings.set_active_profile(name)
+    return name, replaced
 
 
 # --- Кошелёк ----------------------------------------------------------------
@@ -496,26 +529,25 @@ def create_profile(name: str) -> dict:
 
 
 def wallet_net(name: str | None = None) -> dict:
-    """Чистый остаток кошелька по валютам (поступления + обмены − выдачи)."""
+    """Чистый остаток кошелька тура по валютам (поступления + обмены − выдачи)."""
     empty = {cur: 0.0 for cur in CURRENCIES}
-    wallet_sheet = settings.get_wallet_sheet(name)
-    if not wallet_sheet or not os.path.exists(EXCEL_PATH):
+    path = _path_for(name)
+    if not path or not os.path.exists(path):
         return empty
-    wb = load_workbook(EXCEL_PATH, data_only=True)
-    if wallet_sheet not in wb.sheetnames:
+    wb = load_workbook(path, data_only=True)
+    if WALLET_SHEET not in wb.sheetnames:
         return empty
-    return _wallet_net_from_ws(wb[wallet_sheet])
+    return _wallet_net_from_ws(wb[WALLET_SHEET])
 
 
 def add_movement(kind: str, currency: str, amount: float, note: str = "") -> dict:
-    """Добавляет одно движение в кошелёк активного профиля, возвращает остаток."""
-    data_sheet, summary_sheet = _active_sheets()
-    wallet_sheet = settings.get_active_wallet_sheet()
-    wb = _load()
-    ws = wb[wallet_sheet]
+    """Добавляет одно движение в кошелёк активного тура, возвращает остаток."""
+    path = _active_path()
+    wb = _load(path)
+    ws = wb[WALLET_SHEET]
     _append_movement(ws, kind, currency, amount, note)
-    _rebuild_summary(wb, data_sheet, summary_sheet, wallet_sheet)
-    _atomic_save(wb)
+    _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+    _atomic_save(wb, path)
     return _wallet_net_from_ws(ws)
 
 
@@ -527,27 +559,26 @@ def add_exchange(
     kind: str = "Обмен",
 ) -> dict:
     """Записывает обмен: списывает out_cur и зачисляет in_cur. Возвращает остаток."""
-    data_sheet, summary_sheet = _active_sheets()
-    wallet_sheet = settings.get_active_wallet_sheet()
-    wb = _load()
-    ws = wb[wallet_sheet]
+    path = _active_path()
+    wb = _load(path)
+    ws = wb[WALLET_SHEET]
     _append_movement(ws, kind, out_cur, -abs(float(out_amt)), f"→ {in_amt:,.2f} {in_cur}")
     _append_movement(ws, kind, in_cur, abs(float(in_amt)), f"← {out_amt:,.2f} {out_cur}")
-    _rebuild_summary(wb, data_sheet, summary_sheet, wallet_sheet)
-    _atomic_save(wb)
+    _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+    _atomic_save(wb, path)
     return _wallet_net_from_ws(ws)
 
 
 def get_start_balance(name: str | None = None) -> dict:
-    """Начальный баланс профиля по валютам — сумма строк «Старт» в кошельке."""
+    """Начальный баланс тура по валютам — сумма строк «Старт» в кошельке."""
     result = {cur: 0.0 for cur in CURRENCIES}
-    wallet_sheet = settings.get_wallet_sheet(name)
-    if not wallet_sheet or not os.path.exists(EXCEL_PATH):
+    path = _path_for(name)
+    if not path or not os.path.exists(path):
         return result
-    wb = load_workbook(EXCEL_PATH, data_only=True)
-    if wallet_sheet not in wb.sheetnames:
+    wb = load_workbook(path, data_only=True)
+    if WALLET_SHEET not in wb.sheetnames:
         return result
-    for row in wb[wallet_sheet].iter_rows(min_row=2, values_only=True):
+    for row in wb[WALLET_SHEET].iter_rows(min_row=2, values_only=True):
         kind, cur, amt = row[1], row[2], row[3]
         if kind == _START_KIND and cur in result and isinstance(amt, (int, float)):
             result[cur] += amt
@@ -555,14 +586,13 @@ def get_start_balance(name: str | None = None) -> dict:
 
 
 def set_start_balance(pairs: list[tuple[float, str]]) -> dict:
-    """Переписывает начальный баланс активного профиля: удаляет прежние строки
-    «Старт» и записывает новые. Пополнения и обмены не трогаются. Пустой список
-    обнуляет начальный баланс. Дата прежнего «Старта» сохраняется, чтобы правка
-    не «сдвигала» начальный баланс на сегодня. Возвращает остаток кошелька."""
-    data_sheet, summary_sheet = _active_sheets()
-    wallet_sheet = settings.get_active_wallet_sheet()
-    wb = _load()
-    ws = wb[wallet_sheet]
+    """Переписывает начальный баланс активного тура: удаляет прежние строки «Старт»
+    и записывает новые. Пополнения и обмены не трогаются. Пустой список обнуляет
+    начальный баланс. Дата прежнего «Старта» сохраняется, чтобы правка не «сдвигала»
+    начальный баланс на сегодня. Возвращает остаток кошелька."""
+    path = _active_path()
+    wb = _load(path)
+    ws = wb[WALLET_SHEET]
 
     start_date = None
     for row in range(ws.max_row, 1, -1):
@@ -581,63 +611,99 @@ def set_start_balance(pairs: list[tuple[float, str]]) -> dict:
         if merged.get(cur):
             _append_movement(ws, _START_KIND, cur, merged[cur], _START_NOTE, start_date)
 
-    _rebuild_summary(wb, data_sheet, summary_sheet, wallet_sheet)
-    _atomic_save(wb)
+    _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+    _atomic_save(wb, path)
     return _wallet_net_from_ws(ws)
 
 
-def ensure_ids_setup() -> None:
-    """Миграция: проставляет стабильные ID существующим тратам всех профилей."""
-    if not os.path.exists(EXCEL_PATH):
+# --- Миграции ---------------------------------------------------------------
+
+
+def _copy_sheet_rows(src_wb: Workbook, sheet_name: str | None, dst_ws) -> None:
+    """Копирует строки данных (со 2-й) из листа исходной книги в целевой лист,
+    сохраняя значения и числовые форматы."""
+    if not sheet_name or sheet_name not in src_wb.sheetnames:
         return
+    src = src_wb[sheet_name]
+    r = dst_ws.max_row
+    for row in src.iter_rows(min_row=2):
+        if all(c.value is None for c in row):
+            continue
+        r += 1
+        for c in row:
+            nc = dst_ws.cell(row=r, column=c.column, value=c.value)
+            if c.has_style:
+                nc.number_format = c.number_format
+
+
+def migrate_to_files() -> bool:
+    """Разовая миграция со старой схемы (все туры в одном файле, листы на тур) на
+    схему «файл на тур». Идемпотентна: ничего не делает, если у всех туров уже есть
+    `file`. Старый общий файл бэкапится и выводится из обращения."""
     profiles = settings.all_profiles()
-    wb = load_workbook(EXCEL_PATH)
-    changed = False
-    for sheets in profiles.values():
-        data_sheet = sheets.get("data")
-        if data_sheet in wb.sheetnames and _ensure_ids(wb[data_sheet]):
-            changed = True
-    if changed:
-        _atomic_save(wb)
+    legacy = {
+        n: s for n, s in profiles.items()
+        if isinstance(s, dict) and "file" not in s
+    }
+    if not legacy:
+        return False
+
+    legacy_wb = load_workbook(EXCEL_PATH) if os.path.exists(EXCEL_PATH) else None
+    existing = {f.lower() for f in os.listdir(DATA_DIR)} if os.path.isdir(DATA_DIR) else set()
+
+    for name, sheets in legacy.items():
+        filename = _safe_filename(name, existing)
+        existing.add(filename.lower())
+        path = os.path.join(DATA_DIR, filename)
+        wb = _new_workbook()
+        if legacy_wb is not None:
+            _copy_sheet_rows(legacy_wb, sheets.get("data"), wb[DATA_SHEET])
+            _copy_sheet_rows(legacy_wb, sheets.get("wallet_sheet"), wb[WALLET_SHEET])
+        _ensure_ids(wb[DATA_SHEET])
+        _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+        _atomic_save(wb, path)
+        settings.register_profile(name, filename)  # перетирает старую запись на {file}
+
+    # Старый общий файл сохраняем как бэкап и больше не используем.
+    if legacy_wb is not None and os.path.exists(EXCEL_PATH):
+        folder = os.path.dirname(os.path.abspath(EXCEL_PATH)) or "."
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = os.path.join(folder, f"expenses_legacy_backup_{stamp}.xlsx")
+        try:
+            os.replace(EXCEL_PATH, backup)
+        except OSError:
+            shutil.copy2(EXCEL_PATH, backup)
+    return True
+
+
+def ensure_ids_setup() -> None:
+    """Миграция: проставляет стабильные ID тратам во всех файлах туров."""
+    for name in settings.list_profiles():
+        path = _path_for(name)
+        if not path or not os.path.exists(path):
+            continue
+        wb = load_workbook(path)
+        if DATA_SHEET in wb.sheetnames and _ensure_ids(wb[DATA_SHEET]):
+            _atomic_save(wb, path)
 
 
 def ensure_wallet_setup() -> None:
-    """Миграция: создаёт листы «Кошелёк» для всех профилей, переносит старые
-    остатки из settings.json в строки «Старт» и регистрирует листы."""
-    profiles = settings.all_profiles()
-    if not profiles:
-        return
-    wb = _load()
-    existing = set(wb.sheetnames)
-    changed = False
-
-    for name, sheets in profiles.items():
-        wallet_sheet = sheets.get("wallet_sheet")
-        if not wallet_sheet:
-            wallet_sheet = _gen_wallet_name(name, existing)
-        existing.add(wallet_sheet)
-        if wallet_sheet not in wb.sheetnames:
-            _init_wallet_sheet(wb.create_sheet(wallet_sheet))
-            changed = True
-        if sheets.get("wallet_sheet") != wallet_sheet:
-            settings.set_wallet_sheet(name, wallet_sheet)
-            changed = True
-
-        ws = wb[wallet_sheet]
+    """Переносит совсем старый остаток кошелька из settings.json (если ещё остался)
+    в строки «Старт» соответствующего файла тура."""
+    for name in settings.list_profiles():
         legacy = settings.get_legacy_wallet(name)
-        if legacy and ws.max_row < 2:
+        if not legacy:
+            continue
+        path = _path_for(name)
+        if not path:
+            continue
+        wb = _load(path)
+        ws = wb[WALLET_SHEET]
+        if ws.max_row < 2:
             for cur in CURRENCIES:
                 amt = legacy.get(cur)
                 if isinstance(amt, (int, float)) and amt:
                     _append_movement(ws, _START_KIND, cur, amt, _START_NOTE)
-            settings.clear_legacy_wallet(name)
-            changed = True
-
-    if changed:
-        for name, sheets in settings.all_profiles().items():
-            data_sheet = sheets.get("data")
-            summary_sheet = sheets.get("summary")
-            wallet_sheet = sheets.get("wallet_sheet")
-            if data_sheet in wb.sheetnames and summary_sheet in wb.sheetnames:
-                _rebuild_summary(wb, data_sheet, summary_sheet, wallet_sheet)
-        _atomic_save(wb)
+            _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+            _atomic_save(wb, path)
+        settings.clear_legacy_wallet(name)

@@ -576,6 +576,33 @@ def _ex_cb(tag: str, gave, received) -> str:
     return f"{tag}|{g_cur}|{_fmt_amt(g_amt)}|{r_cur}|{_fmt_amt(r_amt)}"
 
 
+def _exchange_primary_kb(state: str, gave, received) -> InlineKeyboardMarkup:
+    """Клавиатура под записанным обменом. state='applied' → кнопка отмены (через
+    подтверждение); state='reversed' → кнопка вернуть обмен (через подтверждение)."""
+    if state == "applied":
+        btn = InlineKeyboardButton(
+            "↩️ Отменить обмен", callback_data=_ex_cb("exunq", gave, received)
+        )
+    else:
+        btn = InlineKeyboardButton(
+            "💼 Вернуть обмен", callback_data=_ex_cb("exapq", gave, received)
+        )
+    return InlineKeyboardMarkup([[btn]])
+
+
+def _exchange_confirm_kb(action: str, gave, received) -> InlineKeyboardMarkup:
+    """Подтверждение движения денег: реальный обмен/возврат двигает кошелёк, поэтому
+    не делаем его одним кликом (раньше случайный тап по старому сообщению откатывал
+    реальный обмен)."""
+    if action == "undo":
+        yes = InlineKeyboardButton("✅ Да, отменить", callback_data=_ex_cb("exun", gave, received))
+        no = InlineKeyboardButton("← Нет", callback_data=_ex_cb("exsa", gave, received))
+    else:
+        yes = InlineKeyboardButton("✅ Да, вернуть", callback_data=_ex_cb("exap", gave, received))
+        no = InlineKeyboardButton("← Нет", callback_data=_ex_cb("exsr", gave, received))
+    return InlineKeyboardMarkup([[yes, no]])
+
+
 async def _exchange_reply(msg, pairs) -> None:
     """Реальный обмен валюты: первая сумма — что отдаю, вторая — что получаю.
     Списывает отданную, зачисляет полученную, показывает выгоду и кнопку отмены."""
@@ -589,10 +616,7 @@ async def _exchange_reply(msg, pairs) -> None:
         )
         t = await asyncio.to_thread(excel_store.compute_totals)
     text += "\n\n✅ Записал в кошелёк:\n" + _format_wallet(net, t["per_currency"])
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("↩️ Отменить обмен", callback_data=_ex_cb("exun", gave, received))]]
-    )
-    await msg.reply_text(text, reply_markup=kb)
+    await msg.reply_text(text, reply_markup=_exchange_primary_kb("applied", gave, received))
 
 
 async def _record_expense(msg, text, success_note="", no_amount_msg=None) -> None:
@@ -993,7 +1017,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    if parts[0] in ("exap", "exun") and len(parts) == 5:
+    if parts[0] in ("exunq", "exapq", "exsa", "exsr", "exap", "exun") and len(parts) == 5:
         g_cur, r_cur = parts[1], parts[3]
         try:
             g_amt, r_amt = float(parts[2]), float(parts[4])
@@ -1001,17 +1025,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer("Не понял суммы обмена.")
             return
         gave, received = (g_amt, g_cur), (r_amt, r_cur)
+
+        # Запрос подтверждения и его отмена — только меняем клавиатуру, деньги не
+        # трогаем. Реальный обмен/возврат двигает кошелёк только по «exap»/«exun».
+        if parts[0] == "exunq":
+            await query.answer()
+            await query.edit_message_reply_markup(_exchange_confirm_kb("undo", gave, received))
+            return
+        if parts[0] == "exapq":
+            await query.answer()
+            await query.edit_message_reply_markup(_exchange_confirm_kb("redo", gave, received))
+            return
+        if parts[0] == "exsa":  # передумал отменять — вернуть кнопку «Отменить обмен»
+            await query.answer("Оставил как есть.")
+            await query.edit_message_reply_markup(_exchange_primary_kb("applied", gave, received))
+            return
+        if parts[0] == "exsr":  # передумал возвращать — оставить «возвращённое» состояние
+            await query.answer("Оставил как есть.")
+            await query.edit_message_reply_markup(_exchange_primary_kb("reversed", gave, received))
+            return
+
         async with _excel_lock:
             if parts[0] == "exap":
                 net = await asyncio.to_thread(
                     excel_store.add_exchange, g_cur, g_amt, r_cur, r_amt
                 )
-                note, new_tag, new_label = "✅ Списано с кошелька.", "exun", "↩️ Отменить обмен"
-            else:
+                note, state = "✅ Обмен снова записан в кошелёк.", "applied"
+            else:  # exun
                 net = await asyncio.to_thread(
                     excel_store.add_exchange, r_cur, r_amt, g_cur, g_amt, "Возврат"
                 )
-                note, new_tag, new_label = "↩️ Обмен отменён.", "exap", "💼 Списать с кошелька"
+                note, state = "↩️ Обмен отменён, деньги вернул в кошелёк.", "reversed"
             t = await asyncio.to_thread(excel_store.compute_totals)
         text = (
             _format_exchange(gave, received)
@@ -1020,10 +1064,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         await query.answer(note)
         await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton(new_label, callback_data=_ex_cb(new_tag, gave, received))]]
-            ),
+            text, reply_markup=_exchange_primary_kb(state, gave, received)
         )
         return
 

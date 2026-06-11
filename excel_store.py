@@ -480,6 +480,29 @@ def create_profile(name: str) -> dict:
     return {"name": name, "file": filename}
 
 
+def delete_profile(name: str) -> dict | None:
+    """Удаляет тур: убирает запись из настроек и переносит его .xlsx в бэкап
+    (файл не стираем — на случай ошибки его можно вернуть). Последний тур удалить
+    нельзя. Возвращает {name, file, backup} или None, если удалить не получилось."""
+    file = settings.get_profile_file(name)
+    if not settings.delete_profile(name):
+        return None
+    backup = None
+    if file:
+        path = os.path.join(DATA_DIR, file)
+        if os.path.exists(path):
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = os.path.splitext(file)[0]
+            backup = f"{base}_deleted_{stamp}.xlsx"
+            dst = os.path.join(DATA_DIR, backup)
+            try:
+                os.replace(path, dst)
+            except OSError:
+                shutil.copy2(path, dst)
+                os.remove(path)
+    return {"name": name, "file": file, "backup": backup}
+
+
 def _normalize_imported(wb: Workbook) -> None:
     """Приводит присланную книгу к структуре файла тура: первый лист считаем
     расходами, гарантируем Итоги/Кошелёк и стабильные id."""

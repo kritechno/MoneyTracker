@@ -179,6 +179,22 @@ def register_profile(name: str, file: str) -> None:
     _save(data)
 
 
+def delete_profile(name: str) -> bool:
+    """Удаляет тур из настроек. Последний тур удалить нельзя (всегда нужен хотя бы
+    один). Если удаляем активный — активным становится любой из оставшихся.
+    Возвращает True, если тур удалён."""
+    name = (name or "").strip()
+    data = _load()
+    profiles = data["profiles"]
+    if name not in profiles or len(profiles) <= 1:
+        return False
+    del profiles[name]
+    if data.get("active_profile") == name:
+        data["active_profile"] = next(iter(profiles))
+    _save(data)
+    return True
+
+
 # --- Кошелёк ----------------------------------------------------------------
 # Источник истины по остатку — лист «Кошелёк» в файле тура (см. excel_store).
 # Ниже — только хелперы разовой миграции совсем старого формата кошелька, когда

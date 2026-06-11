@@ -106,6 +106,39 @@ class ProfileFilesTest(unittest.TestCase):
         backups = glob.glob(os.path.join(self.tmp, "Greece 2026_backup_*.xlsx"))
         self.assertEqual(len(backups), 1)
 
+    def test_delete_profile_archives_file_and_switches_active(self):
+        self.store.create_profile("Italy 2026")
+        self.settings.set_active_profile("Italy 2026")
+        self._add("Pizza", 20, "USD")
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "Italy 2026.xlsx")))
+
+        info = self.store.delete_profile("Italy 2026")
+        self.assertIsNotNone(info)
+        self.assertEqual(info["name"], "Italy 2026")
+        # Запись в настройках убрана, активным стал оставшийся тур.
+        self.assertFalse(self.settings.profile_exists("Italy 2026"))
+        self.assertEqual(self.settings.get_active_profile(), "FDTG tour 2026")
+        # Исходный файл перенесён в бэкап, а не стёрт безвозвратно.
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "Italy 2026.xlsx")))
+        backups = glob.glob(os.path.join(self.tmp, "Italy 2026_deleted_*.xlsx"))
+        self.assertEqual(len(backups), 1)
+
+    def test_cannot_delete_last_profile(self):
+        # По умолчанию один тур — удалить его нельзя (всегда нужен хотя бы один).
+        self.assertEqual(len(self.settings.list_profiles()), 1)
+        self.assertIsNone(self.store.delete_profile("FDTG tour 2026"))
+        self.assertTrue(self.settings.profile_exists("FDTG tour 2026"))
+        self.assertFalse(
+            glob.glob(os.path.join(self.tmp, "FDTG tour 2026_deleted_*.xlsx"))
+        )
+
+    def test_delete_missing_profile_returns_none(self):
+        self.store.create_profile("Italy 2026")
+        self.assertIsNone(self.store.delete_profile("Нет такого тура"))
+        # Существующие туры на месте.
+        self.assertTrue(self.settings.profile_exists("Italy 2026"))
+        self.assertTrue(self.settings.profile_exists("FDTG tour 2026"))
+
     def test_migrate_legacy_single_workbook(self):
         # Старая схема: один файл с листами на тур + старый settings.json.
         wb = Workbook()

@@ -56,6 +56,30 @@ class _NoAmount(Exception):
 # Применяется, если в тексте есть две суммы: первая — что отдаю, вторая — что получаю.
 _ACTION_RE = re.compile(r"(?i)(помен[яе]|обмен[яе]|размен[яе])")
 
+# Подсказка, когда сообщение похоже на обмен, но распознана только одна сторона.
+# Раньше такое уходило в обычную запись и Gemini писал «трату-призрак», из-за чего
+# съезжал остаток. Теперь просим явный формат и ничего не записываем.
+_EXCHANGE_HELP = (
+    "💱 Похоже на обмен валюты, но я не разобрал обе суммы.\n"
+    "Напиши обе стороны с валютами, например:\n"
+    "• поменял 100 долларов на 48000 тенге\n"
+    "• обменял 30 долларов 15000 тенге\n\n"
+    "Если это обычная трата — напиши без слова «поменял/обменял», "
+    "например «Шиномонтаж 5000»."
+)
+
+
+def _action_kind(pairs: list) -> str:
+    """Решает, что делать с сообщением, в котором есть глагол обмена.
+    pairs — распознанные (сумма, валюта) из currency.parse_amounts.
+    ≥2 пары → настоящий обмен; ровно 1 → недописанный обмен (просим формат);
+    0 → валюты нет вовсе, это обычная трата («поменял колесо 5000»)."""
+    if len(pairs) >= 2:
+        return "exchange"
+    if len(pairs) == 1:
+        return "ask"
+    return "expense"
+
 
 def _is_allowed(user_id: int) -> bool:
     """Пускаем владельца и список из .env, плюс тех, кому владелец выдал доступ
@@ -301,22 +325,51 @@ async def currency_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-def _profiles_keyboard(active: str, names: list[str]) -> InlineKeyboardMarkup:
+def _profiles_keyboard(
+    active: str, names: list[str], can_delete: bool = False
+) -> InlineKeyboardMarkup:
     rows = []
     for i, name in enumerate(names):
         mark = "✅ " if name == active else ""
         rows.append([InlineKeyboardButton(f"{mark}{name}", callback_data=f"prof|{i}")])
     rows.append([InlineKeyboardButton("➕ Новый тур", callback_data="prof_new")])
+    # Удаление — только владельцу и только если есть что оставить (нельзя удалить
+    # последний тур).
+    if can_delete and len(names) > 1:
+        rows.append([InlineKeyboardButton("🗑 Удалить тур", callback_data="prof_delmenu")])
     return InlineKeyboardMarkup(rows)
+
+
+def _profiles_delete_keyboard(active: str, names: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for i, name in enumerate(names):
+        mark = "✅ " if name == active else ""
+        rows.append([InlineKeyboardButton(f"🗑 {mark}{name}", callback_data=f"profdel|{i}")])
+    rows.append([InlineKeyboardButton("← Назад", callback_data="prof_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _profile_confirm_delete_keyboard(index: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Да, удалить", callback_data=f"profdelok|{index}")],
+        [InlineKeyboardButton("← Отмена", callback_data="prof_delmenu")],
+    ])
+
+
+_PROFILES_INTRO = (
+    "📂 Активный тур: {active}\n"
+    "Новые траты попадут в этот тур. Выбери другой или создай новый:"
+)
 
 
 async def profiles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     active = await asyncio.to_thread(settings.get_active_profile)
     names = await asyncio.to_thread(settings.list_profiles)
+    user = update.effective_user
+    can_delete = bool(user) and await asyncio.to_thread(_is_admin, user.id)
     await update.message.reply_text(
-        f"📂 Активный тур: {active}\n"
-        "Новые траты попадут в этот тур. Выбери другой или создай новый:",
-        reply_markup=_profiles_keyboard(active, names),
+        _PROFILES_INTRO.format(active=active),
+        reply_markup=_profiles_keyboard(active, names, can_delete),
     )
 
 
@@ -785,9 +838,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Реальный обмен: глагол действия + минимум две суммы → двигаем кошелёк.
     if _ACTION_RE.search(text):
         pairs = await asyncio.to_thread(currency.parse_amounts, text)
-        if len(pairs) >= 2:
+        kind = _action_kind(pairs)
+        if kind == "exchange":
             await _exchange_reply(msg, pairs)
             return
+        if kind == "ask":
+            # Недописанный обмен: не пишем трату-призрак, просим явный формат.
+            await msg.reply_text(_EXCHANGE_HELP)
+            return
+        # kind == "expense": валюты не было — это обычная трата, пишем как обычно.
     await _record_expense(msg, msg.text)
 
 
@@ -854,11 +913,83 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer("Тур не найден.")
             return
         await asyncio.to_thread(settings.set_active_profile, name)
+        can_delete = await asyncio.to_thread(_is_admin, query.from_user.id)
         await query.answer(f"Тур: {name}")
         await query.edit_message_text(
-            f"📂 Активный тур: {name}\n"
-            "Новые траты попадут в этот тур. Выбери другой или создай новый:",
-            reply_markup=_profiles_keyboard(name, names),
+            _PROFILES_INTRO.format(active=name),
+            reply_markup=_profiles_keyboard(name, names, can_delete),
+        )
+        return
+
+    if parts[0] == "prof_menu":
+        active = await asyncio.to_thread(settings.get_active_profile)
+        names = await asyncio.to_thread(settings.list_profiles)
+        can_delete = await asyncio.to_thread(_is_admin, query.from_user.id)
+        await query.answer()
+        await query.edit_message_text(
+            _PROFILES_INTRO.format(active=active),
+            reply_markup=_profiles_keyboard(active, names, can_delete),
+        )
+        return
+
+    if parts[0] == "prof_delmenu":
+        if not await asyncio.to_thread(_is_admin, query.from_user.id):
+            await query.answer("⛔️ Удалять туры может только владелец.", show_alert=True)
+            return
+        names = await asyncio.to_thread(settings.list_profiles)
+        if len(names) <= 1:
+            await query.answer("Это единственный тур — удалить нельзя.", show_alert=True)
+            return
+        active = await asyncio.to_thread(settings.get_active_profile)
+        await query.answer()
+        await query.edit_message_text(
+            "🗑 Какой тур удалить? Выбери из списка.\n"
+            "Файл тура уйдёт в бэкап, из бота тур пропадёт.",
+            reply_markup=_profiles_delete_keyboard(active, names),
+        )
+        return
+
+    if parts[0] == "profdel" and len(parts) == 2:
+        if not await asyncio.to_thread(_is_admin, query.from_user.id):
+            await query.answer("⛔️ Удалять туры может только владелец.", show_alert=True)
+            return
+        names = await asyncio.to_thread(settings.list_profiles)
+        try:
+            name = names[int(parts[1])]
+        except (ValueError, IndexError):
+            await query.answer("Тур не найден.")
+            return
+        await query.answer()
+        await query.edit_message_text(
+            f"🗑 Удалить тур «{name}»?\n"
+            "Траты и кошелёк этого тура пропадут из бота (файл сохраню в бэкап).",
+            reply_markup=_profile_confirm_delete_keyboard(int(parts[1])),
+        )
+        return
+
+    if parts[0] == "profdelok" and len(parts) == 2:
+        if not await asyncio.to_thread(_is_admin, query.from_user.id):
+            await query.answer("⛔️ Удалять туры может только владелец.", show_alert=True)
+            return
+        names = await asyncio.to_thread(settings.list_profiles)
+        try:
+            name = names[int(parts[1])]
+        except (ValueError, IndexError):
+            await query.answer("Тур не найден.")
+            return
+        async with _excel_lock:
+            info = await asyncio.to_thread(excel_store.delete_profile, name)
+        if info is None:
+            await query.answer("Не удалось удалить (последний тур?).", show_alert=True)
+            return
+        active = await asyncio.to_thread(settings.get_active_profile)
+        names = await asyncio.to_thread(settings.list_profiles)
+        can_delete = await asyncio.to_thread(_is_admin, query.from_user.id)
+        await query.answer(f"Тур «{name}» удалён.")
+        await query.edit_message_text(
+            f"🗑 Тур «{name}» удалён (файл в бэкапе).\n\n"
+            + _PROFILES_INTRO.format(active=active),
+            reply_markup=_profiles_keyboard(active, names, can_delete),
         )
         return
 

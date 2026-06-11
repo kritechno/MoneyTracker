@@ -432,11 +432,15 @@ def _format_start_balance(start: dict) -> str:
     return ", ".join(parts) if parts else "не задан (0)"
 
 
-def _wallet_keyboard(can_manage: bool = False) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("✏️ Исправить начальный баланс", callback_data="setstart")]]
-    if can_manage:
-        rows.append([InlineKeyboardButton("🗑 Удалить движение", callback_data="wdlist")])
-    return InlineKeyboardMarkup(rows)
+def _wallet_keyboard(can_manage: bool = False) -> InlineKeyboardMarkup | None:
+    """Правка баланса/кошелька — только владельцу. Гость видит кошелёк без кнопок."""
+    if not can_manage:
+        return None
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚖️ Задать остаток", callback_data="wsetbal")],
+        [InlineKeyboardButton("✏️ Исправить начальный баланс", callback_data="setstart")],
+        [InlineKeyboardButton("🗑 Удалить движение", callback_data="wdlist")],
+    ])
 
 
 def _group_movements(rows: list[dict]) -> list[dict]:
@@ -841,7 +845,73 @@ async def _prompt_start_balance(msg, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def start_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user is None or not await asyncio.to_thread(_is_admin, user.id):
+        await update.message.reply_text("⛔️ Менять баланс может только владелец бота.")
+        return
     await _prompt_start_balance(update.message, context)
+
+
+async def _prompt_set_balance(msg, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает текущий остаток активного тура и ждёт нужное значение, чтобы
+    выставить остаток ровно таким (через движение «Коррекция»)."""
+    profile = await asyncio.to_thread(settings.get_active_profile)
+    net = await asyncio.to_thread(excel_store.wallet_net)
+    t = await asyncio.to_thread(excel_store.compute_totals)
+    bal = _wallet_balances(net, t["per_currency"])
+    shown = ", ".join(
+        f"{bal[c]:,.0f} {c}" for c in CURRENCIES if bal[c] or net.get(c)
+    ) or "пусто"
+    context.user_data["awaiting_edit"] = None
+    context.user_data["awaiting_profile_name"] = False
+    context.user_data.pop("awaiting_wallet_for", None)
+    context.user_data["awaiting_start_balance"] = False
+    context.user_data["awaiting_set_balance"] = True
+    await msg.reply_text(
+        f"📂 Тур: {profile}\n"
+        f"Текущий остаток: {shown}\n\n"
+        "Пришли нужный остаток одним сообщением:\n"
+        "«164000 тенге» или «164000 тенге 4405 долларов»\n\n"
+        "Запишу корректировку, чтобы остаток стал ровно таким. «-» — отмена."
+    )
+
+
+async def set_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user is None or not await asyncio.to_thread(_is_admin, user.id):
+        await update.message.reply_text("⛔️ Менять баланс может только владелец бота.")
+        return
+    await _prompt_set_balance(update.message, context)
+
+
+async def _apply_set_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    context.user_data["awaiting_set_balance"] = False
+    user = update.effective_user
+    if user is None or not await asyncio.to_thread(_is_admin, user.id):
+        await msg.reply_text("⛔️ Менять баланс может только владелец бота.")
+        return
+    text = (msg.text or "").strip()
+    if text.lower() in {"-", "отмена", "нет", "cancel", "skip", "пропустить"}:
+        await msg.reply_text("Ок, остаток не меняю.")
+        return
+    pairs = await asyncio.to_thread(currency.parse_amounts, text)
+    if not pairs:
+        context.user_data["awaiting_set_balance"] = True  # дать повторить ввод
+        await msg.reply_text(
+            "Не понял сумму. Пример: «164000 тенге» или «164000 тенге 4405 долларов».\n"
+            "«-» — отмена."
+        )
+        return
+    async with _excel_lock:
+        net = await asyncio.to_thread(excel_store.set_balance, pairs)
+        t = await asyncio.to_thread(excel_store.compute_totals)
+    profile = await asyncio.to_thread(settings.get_active_profile)
+    await msg.reply_text(
+        f"✅ Остаток тура «{profile}» обновлён (записал «Коррекция»).\n\n"
+        + _format_wallet(net, t["per_currency"]),
+        reply_markup=_wallet_keyboard(True),
+    )
 
 
 async def _apply_start_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -929,6 +999,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if context.user_data.get("awaiting_start_balance"):
         await _apply_start_balance(update, context)
         return
+    if context.user_data.get("awaiting_set_balance"):
+        await _apply_set_balance(update, context)
+        return
     # Реальный обмен: глагол действия + минимум две суммы → двигаем кошелёк.
     if _ACTION_RE.search(text):
         pairs = await asyncio.to_thread(currency.parse_amounts, text)
@@ -994,9 +1067,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    if parts[0] == "setstart":
+    if parts[0] in ("setstart", "wsetbal"):
+        if not await asyncio.to_thread(_is_admin, query.from_user.id):
+            await query.answer("⛔️ Менять баланс может только владелец.", show_alert=True)
+            return
         await query.answer()
-        await _prompt_start_balance(query.message, context)
+        if parts[0] == "wsetbal":
+            await _prompt_set_balance(query.message, context)
+        else:
+            await _prompt_start_balance(query.message, context)
         return
 
     if parts[0] == "prof" and len(parts) == 2:
@@ -1424,6 +1503,7 @@ def main() -> None:
     app.add_handler(CommandHandler("wallet", wallet_cmd))
     app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("startbalance", start_balance_cmd))
+    app.add_handler(CommandHandler("setbalance", set_balance_cmd))
     app.add_handler(CommandHandler("allow", allow_cmd))
     app.add_handler(CommandHandler("disallow", disallow_cmd))
     app.add_handler(CommandHandler("allowed", allowed_cmd))

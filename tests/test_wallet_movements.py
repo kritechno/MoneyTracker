@@ -94,5 +94,54 @@ class WalletMovementsTest(unittest.TestCase):
         self.assertEqual(net["KZT"], 48700.0)
 
 
+class SetBalanceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["EXCEL_PATH"] = os.path.join(self.tmp, "expenses.xlsx")
+        os.environ["SETTINGS_PATH"] = os.path.join(self.tmp, "settings.json")
+        self.settings, self.store = _reload_stack()
+        self.assertTrue(self.store.EXCEL_PATH.startswith(self.tmp))
+
+    def tearDown(self):
+        os.environ.pop("EXCEL_PATH", None)
+        os.environ.pop("SETTINGS_PATH", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        _reload_stack()
+
+    def _remaining(self, cur):
+        net = self.store.wallet_net()
+        tot = self.store.compute_totals()
+        return round(net[cur] - tot["per_currency"][cur], 2)
+
+    def test_set_balance_makes_remaining_exact(self):
+        self.store.add_movement("Пополнение", "KZT", 500000)
+        self.store.add_expense({
+            "date": "2026-06-11", "description": "x", "amount": 30000,
+            "currency": "KZT", "category": "Прочее", "amount_usd": 60,
+        })
+        self.assertEqual(self._remaining("KZT"), 470000.0)
+        self.store.set_balance([(164000, "KZT")])
+        self.assertEqual(self._remaining("KZT"), 164000.0)
+
+    def test_set_balance_idempotent(self):
+        self.store.add_movement("Пополнение", "KZT", 100000)
+        self.store.set_balance([(164000, "KZT")])
+        self.store.set_balance([(164000, "KZT")])  # повтор не должен сдвинуть
+        self.assertEqual(self._remaining("KZT"), 164000.0)
+
+    def test_set_balance_only_records_correction(self):
+        # «Коррекция» — обычное движение кошелька; начальный баланс не трогается.
+        self.store.set_balance([(164000, "KZT")])
+        kinds = [m["kind"] for m in self.store.list_movements()]
+        self.assertIn("Коррекция", kinds)
+        self.assertEqual(self.store.get_start_balance()["KZT"], 0.0)
+
+    def test_set_balance_multi_currency(self):
+        self.store.add_movement("Пополнение", "USD", 1000)
+        self.store.set_balance([(164000, "KZT"), (4405, "USD")])
+        self.assertEqual(self._remaining("KZT"), 164000.0)
+        self.assertEqual(self._remaining("USD"), 4405.0)
+
+
 if __name__ == "__main__":
     unittest.main()

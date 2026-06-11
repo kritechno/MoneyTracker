@@ -27,6 +27,7 @@ _WALLET_WIDTHS = [12, 16, 10, 14, 30]
 _WALLET_ID_COL = 6  # скрытый столбец стабильного id движения кошелька
 _START_KIND = "Старт"  # вид движения «начальный баланс» кошелька
 _START_NOTE = "Начальный баланс"
+_ADJUST_KIND = "Коррекция"  # ручная правка остатка владельцем (set_balance)
 _HEADER_FILL = PatternFill("solid", fgColor="4472C4")
 _HEADER_FONT = Font(bold=True, color="FFFFFF")
 _TITLE_FONT = Font(bold=True, size=12)
@@ -747,6 +748,32 @@ def set_start_balance(pairs: list[tuple[float, str]]) -> dict:
     for cur in CURRENCIES:
         if merged.get(cur):
             _append_movement(ws, _START_KIND, cur, merged[cur], _START_NOTE, start_date)
+
+    _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+    _atomic_save(wb, path)
+    return _wallet_net_from_ws(ws)
+
+
+def set_balance(pairs: list[tuple[float, str]]) -> dict:
+    """Делает текущий остаток (кошелёк − траты) по каждой валюте ровно равным
+    заданному, дописывая одно движение «Коррекция» на разницу. Прежние движения и
+    траты не трогаются — правка прозрачна и её видно/можно удалить в истории.
+    Возвращает чистый остаток кошелька (net) после правки."""
+    path = _active_path()
+    wb = _load(path)
+    ws = wb[WALLET_SHEET]
+    net = _wallet_net_from_ws(ws)
+    totals = _aggregate(wb[DATA_SHEET])
+
+    merged: dict[str, float] = {}
+    for amount, cur in pairs:
+        if cur in CURRENCIES:
+            merged[cur] = float(amount)  # последнее значение по валюте побеждает
+    for cur, target in merged.items():
+        remaining = round(net.get(cur, 0.0) - totals["per_currency"].get(cur, 0.0), 2)
+        delta = round(target - remaining, 2)
+        if delta:
+            _append_movement(ws, _ADJUST_KIND, cur, delta, f"Остаток → {target:,.2f} {cur}")
 
     _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
     _atomic_save(wb, path)

@@ -73,5 +73,29 @@ class ExchangeUndoConfirmTest(unittest.TestCase):
         self.assertEqual(tags, ["exap", "exsr"])
 
 
+class MovementGroupingTest(unittest.TestCase):
+    """Список движений кошелька склеивает две ноги обмена в одну запись."""
+
+    def test_exchange_legs_grouped(self):
+        rows = [
+            {"id": 1, "kind": "Пополнение", "currency": "USD", "amount": 6000, "note": ""},
+            {"id": 2, "kind": "Обмен", "currency": "USD", "amount": -100, "note": "→ 48,700.00 KZT"},
+            {"id": 3, "kind": "Обмен", "currency": "KZT", "amount": 48700, "note": "← 100.00 USD"},
+        ]
+        groups = bot._group_movements(rows)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(len(groups[0]["legs"]), 1)   # Пополнение
+        self.assertEqual(len(groups[1]["legs"]), 2)   # обе ноги обмена вместе
+        self.assertEqual(groups[1]["id"], 2)          # удаление по id первой ноги
+        self.assertIn("USD", bot._movement_label(groups[1]))
+        self.assertIn("KZT", bot._movement_label(groups[1]))
+
+    def test_single_topup_label(self):
+        rows = [{"id": 5, "kind": "Пополнение", "currency": "USD", "amount": 500, "note": ""}]
+        groups = bot._group_movements(rows)
+        self.assertEqual(len(groups), 1)
+        self.assertIn("+500", bot._movement_label(groups[0]))
+
+
 if __name__ == "__main__":
     unittest.main()

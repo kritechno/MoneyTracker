@@ -24,6 +24,7 @@ _DATA_WIDTHS = [12, 34, 12, 10, 14, 12, 8]
 _ID_COL = 7  # технический столбец стабильного идентификатора (скрыт)
 _WALLET_HEADERS = ["Дата", "Тип", "Валюта", "Сумма", "Примечание"]
 _WALLET_WIDTHS = [12, 16, 10, 14, 30]
+_WALLET_ID_COL = 6  # скрытый столбец стабильного id движения кошелька
 _START_KIND = "Старт"  # вид движения «начальный баланс» кошелька
 _START_NOTE = "Начальный баланс"
 _HEADER_FILL = PatternFill("solid", fgColor="4472C4")
@@ -95,6 +96,11 @@ def _init_wallet_sheet(ws) -> None:
         cell.alignment = Alignment(horizontal="center")
     for i, w in enumerate(_WALLET_WIDTHS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
+    idc = ws.cell(row=1, column=_WALLET_ID_COL, value="ID")
+    idc.fill = _HEADER_FILL
+    idc.font = _HEADER_FONT
+    idc.alignment = Alignment(horizontal="center")
+    ws.column_dimensions[get_column_letter(_WALLET_ID_COL)].hidden = True
     ws.freeze_panes = "A2"
 
 
@@ -137,9 +143,66 @@ def _load(path: str) -> Workbook:
     return wb
 
 
+def _next_wallet_id(ws) -> int:
+    """Следующий свободный id движения кошелька (max существующих + 1)."""
+    mx = 0
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        v = row[_WALLET_ID_COL - 1] if len(row) >= _WALLET_ID_COL else None
+        if isinstance(v, int) and v > mx:
+            mx = v
+    return mx + 1
+
+
+def _find_wallet_row_by_id(ws, movement_id: int) -> int | None:
+    for row in range(2, ws.max_row + 1):
+        if ws.cell(row=row, column=_WALLET_ID_COL).value == movement_id:
+            return row
+    return None
+
+
+def _ensure_wallet_ids(ws) -> bool:
+    """Миграция листа «Кошелёк»: гарантирует скрытый заголовок ID и проставляет
+    стабильные id движениям без него."""
+    changed = False
+    if ws.cell(row=1, column=_WALLET_ID_COL).value != "ID":
+        cell = ws.cell(row=1, column=_WALLET_ID_COL, value="ID")
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+        cell.alignment = Alignment(horizontal="center")
+        ws.column_dimensions[get_column_letter(_WALLET_ID_COL)].hidden = True
+        changed = True
+    nxt = _next_wallet_id(ws)
+    for row in range(2, ws.max_row + 1):
+        has_data = ws.cell(row=row, column=2).value is not None
+        cur_id = ws.cell(row=row, column=_WALLET_ID_COL).value
+        if has_data and not isinstance(cur_id, int):
+            ws.cell(row=row, column=_WALLET_ID_COL, value=nxt)
+            nxt += 1
+            changed = True
+    return changed
+
+
+def _wallet_row_dict(ws, row: int) -> dict | None:
+    if row < 2 or row > ws.max_row:
+        return None
+    kind = ws.cell(row=row, column=2).value
+    if kind is None:
+        return None
+    d = ws.cell(row=row, column=1).value
+    return {
+        "id": ws.cell(row=row, column=_WALLET_ID_COL).value,
+        "date": d.date().isoformat() if isinstance(d, datetime) else (str(d) if d else ""),
+        "kind": kind,
+        "currency": ws.cell(row=row, column=3).value,
+        "amount": ws.cell(row=row, column=4).value,
+        "note": ws.cell(row=row, column=5).value,
+    }
+
+
 def _append_movement(
     ws, kind: str, currency: str, amount: float, note: str = "", on_date: date | None = None
 ) -> None:
+    _ensure_wallet_ids(ws)  # гарантируем скрытый столбец id перед записью
     next_row = ws.max_row + 1 if ws.max_row >= 1 else 2
     if next_row < 2:
         next_row = 2
@@ -150,6 +213,7 @@ def _append_movement(
     c = ws.cell(row=next_row, column=4, value=round(float(amount), 2))
     c.number_format = "#,##0.00"
     ws.cell(row=next_row, column=5, value=note)
+    ws.cell(row=next_row, column=_WALLET_ID_COL, value=_next_wallet_id(ws))
 
 
 def _wallet_net_from_ws(ws) -> dict:
@@ -592,6 +656,56 @@ def add_exchange(
     return _wallet_net_from_ws(ws)
 
 
+def list_movements(name: str | None = None) -> list[dict]:
+    """Движения кошелька тура в порядке записи: id/дата/тип/валюта/сумма/примечание."""
+    path = _path_for(name)
+    if not path or not os.path.exists(path):
+        return []
+    wb = load_workbook(path, data_only=True)
+    if WALLET_SHEET not in wb.sheetnames:
+        return []
+    ws = wb[WALLET_SHEET]
+    out = []
+    for row in range(2, ws.max_row + 1):
+        m = _wallet_row_dict(ws, row)
+        if m is not None:
+            out.append(m)
+    return out
+
+
+def delete_movement(movement_id: int) -> list[dict] | None:
+    """Удаляет движение кошелька активного тура по стабильному id. Обмен/Возврат
+    удаляется обеими ногами (списание + зачисление), чтобы остаток не разъехался.
+    Возвращает список удалённых движений (1 или 2) либо None, если id не найден."""
+    path = _active_path()
+    wb = _load(path)
+    ws = wb[WALLET_SHEET]
+    _ensure_wallet_ids(ws)
+    row = _find_wallet_row_by_id(ws, movement_id)
+    if row is None:
+        return None
+    target = _wallet_row_dict(ws, row)
+    rows = {row}
+    deleted = [target]
+    note = target.get("note") or ""
+    # Обмен/Возврат пишутся двумя соседними строками с зеркальными стрелками (→/←):
+    # удаляем парную ногу той же операции, иначе кошелёк станет несбалансированным.
+    if target["kind"] in ("Обмен", "Возврат") and (note.startswith("→") or note.startswith("←")):
+        mirror = "←" if note.startswith("→") else "→"
+        for sib in (row + 1, row - 1):
+            if 2 <= sib <= ws.max_row and sib not in rows:
+                s = _wallet_row_dict(ws, sib)
+                if s and s["kind"] == target["kind"] and (s.get("note") or "").startswith(mirror):
+                    rows.add(sib)
+                    deleted.append(s)
+                    break
+    for r in sorted(rows, reverse=True):
+        ws.delete_rows(r, 1)
+    _rebuild_summary(wb, DATA_SHEET, SUMMARY_SHEET, WALLET_SHEET)
+    _atomic_save(wb, path)
+    return deleted
+
+
 def get_start_balance(name: str | None = None) -> dict:
     """Начальный баланс тура по валютам — сумма строк «Старт» в кошельке."""
     result = {cur: 0.0 for cur in CURRENCIES}
@@ -707,6 +821,18 @@ def ensure_ids_setup() -> None:
             continue
         wb = load_workbook(path)
         if DATA_SHEET in wb.sheetnames and _ensure_ids(wb[DATA_SHEET]):
+            _atomic_save(wb, path)
+
+
+def ensure_wallet_ids_setup() -> None:
+    """Миграция: проставляет стабильные id движениям кошелька во всех файлах туров,
+    чтобы их можно было удалять по id (см. delete_movement)."""
+    for name in settings.list_profiles():
+        path = _path_for(name)
+        if not path or not os.path.exists(path):
+            continue
+        wb = load_workbook(path)
+        if WALLET_SHEET in wb.sheetnames and _ensure_wallet_ids(wb[WALLET_SHEET]):
             _atomic_save(wb, path)
 
 

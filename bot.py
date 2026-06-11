@@ -432,10 +432,78 @@ def _format_start_balance(start: dict) -> str:
     return ", ".join(parts) if parts else "не задан (0)"
 
 
-def _wallet_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✏️ Исправить начальный баланс", callback_data="setstart")]]
-    )
+def _wallet_keyboard(can_manage: bool = False) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("✏️ Исправить начальный баланс", callback_data="setstart")]]
+    if can_manage:
+        rows.append([InlineKeyboardButton("🗑 Удалить движение", callback_data="wdlist")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _group_movements(rows: list[dict]) -> list[dict]:
+    """Группирует две ноги обмена/возврата (→ списание, ← зачисление) в одну запись.
+    Ноги пишутся соседними строками, поэтому склеиваем по зеркальным стрелкам."""
+    groups: list[dict] = []
+    i = 0
+    while i < len(rows):
+        m = rows[i]
+        note = m.get("note") or ""
+        nxt = rows[i + 1] if i + 1 < len(rows) else None
+        paired = (
+            m["kind"] in ("Обмен", "Возврат")
+            and note.startswith("→")
+            and nxt is not None
+            and nxt["kind"] == m["kind"]
+            and (nxt.get("note") or "").startswith("←")
+        )
+        if paired:
+            groups.append({"id": m["id"], "kind": m["kind"], "legs": [m, nxt]})
+            i += 2
+        else:
+            groups.append({"id": m["id"], "kind": m["kind"], "legs": [m]})
+            i += 1
+    return groups
+
+
+def _movement_label(g: dict) -> str:
+    """Короткая подпись операции кошелька для кнопки/списка."""
+    if len(g["legs"]) == 2:
+        out_leg, in_leg = g["legs"]
+        return (
+            f"{g['kind']}: {out_leg['amount']:,.0f} {out_leg['currency']} "
+            f"→ +{in_leg['amount']:,.0f} {in_leg['currency']}"
+        )
+    m = g["legs"][0]
+    amt = m["amount"] or 0
+    sign = "+" if amt >= 0 else ""
+    label = f"{g['kind']}: {sign}{amt:,.0f} {m['currency']}"
+    if m["kind"] == "Старт" or not (m.get("note") or "").strip():
+        return label
+    return f"{label} · {m['note']}"
+
+
+async def _show_movements(query) -> None:
+    """Список последних движений кошелька с кнопками удаления (только владельцу)."""
+    rows = await asyncio.to_thread(excel_store.list_movements)
+    groups = _group_movements(rows)
+    profile = await asyncio.to_thread(settings.get_active_profile)
+    if not groups:
+        await query.edit_message_text(f"📂 Тур: {profile}\n\n💼 В кошельке нет движений.")
+        return
+    recent = groups[-12:]
+    lines = [
+        f"🗑 Удаление движения кошелька · {profile}",
+        "Выбери, что удалить. Обмен/возврат удалится обеими ногами.",
+        "",
+    ]
+    buttons = []
+    for g in recent:
+        lines.append(f"• {_movement_label(g)}")
+        if isinstance(g["id"], int):
+            buttons.append(
+                [InlineKeyboardButton(f"🗑 {_movement_label(g)}", callback_data=f"wdel|{g['id']}")]
+            )
+    buttons.append([InlineKeyboardButton("← Закрыть", callback_data="wdclose")])
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
 
 
 def _fmt_amt(a: float) -> str:
@@ -496,12 +564,14 @@ async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     profile = await asyncio.to_thread(settings.get_active_profile)
     net = await asyncio.to_thread(excel_store.wallet_net)
     t = await asyncio.to_thread(excel_store.compute_totals)
+    user = update.effective_user
+    can_manage = bool(user) and await asyncio.to_thread(_is_admin, user.id)
     await update.message.reply_text(
         f"📂 Тур: {profile}\n\n"
         + _format_wallet(net, t["per_currency"])
         + "\n\n➕ Пополнить: /add 5000 USD\n"
         "💱 Обмен: «поменял 30 долларов на 15000 тенге»",
-        reply_markup=_wallet_keyboard(),
+        reply_markup=_wallet_keyboard(can_manage),
     )
 
 
@@ -1017,6 +1087,66 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    if parts[0] in ("wdlist", "wdclose", "wdel", "wdelc"):
+        if not await asyncio.to_thread(_is_admin, query.from_user.id):
+            await query.answer("⛔️ Удалять движения может только владелец.", show_alert=True)
+            return
+        if parts[0] == "wdclose":
+            await query.answer()
+            profile = await asyncio.to_thread(settings.get_active_profile)
+            net = await asyncio.to_thread(excel_store.wallet_net)
+            t = await asyncio.to_thread(excel_store.compute_totals)
+            await query.edit_message_text(
+                f"📂 Тур: {profile}\n\n" + _format_wallet(net, t["per_currency"]),
+                reply_markup=_wallet_keyboard(True),
+            )
+            return
+        if parts[0] == "wdlist":
+            await query.answer()
+            await _show_movements(query)
+            return
+        try:
+            movement_id = int(parts[1])
+        except (IndexError, ValueError):
+            await query.answer("Не понял движение.")
+            return
+        if parts[0] == "wdel":  # запрос подтверждения — деньги не трогаем
+            rows = await asyncio.to_thread(excel_store.list_movements)
+            groups = {g["id"]: g for g in _group_movements(rows)}
+            g = groups.get(movement_id)
+            if g is None:
+                await query.answer("Движение не найдено (возможно, уже удалено).")
+                await _show_movements(query)
+                return
+            await query.answer()
+            await query.edit_message_text(
+                f"🗑 Удалить движение?\n\n• {_movement_label(g)}\n\n"
+                "Остаток кошелька пересчитается. Это не трата, а движение кошелька.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Да, удалить", callback_data=f"wdelc|{movement_id}"),
+                    InlineKeyboardButton("← Нет", callback_data="wdlist"),
+                ]]),
+            )
+            return
+        # wdelc — подтверждённое удаление: двигаем кошелёк.
+        async with _excel_lock:
+            deleted = await asyncio.to_thread(excel_store.delete_movement, movement_id)
+            net = await asyncio.to_thread(excel_store.wallet_net)
+            t = await asyncio.to_thread(excel_store.compute_totals)
+        if not deleted:
+            await query.answer("Движение не найдено (возможно, уже удалено).")
+            await _show_movements(query)
+            return
+        what = "; ".join(
+            f"{d['kind']} {(d['amount'] or 0):,.0f} {d['currency']}" for d in deleted
+        )
+        await query.answer("Удалено.")
+        await query.edit_message_text(
+            f"🗑 Удалил из кошелька: {what}\n\n" + _format_wallet(net, t["per_currency"]),
+            reply_markup=_wallet_keyboard(True),
+        )
+        return
+
     if parts[0] in ("exunq", "exapq", "exsa", "exsr", "exap", "exun") and len(parts) == 5:
         g_cur, r_cur = parts[1], parts[3]
         try:
@@ -1273,6 +1403,7 @@ async def _post_init(app: Application) -> None:
     await asyncio.to_thread(excel_store.migrate_to_files)
     await asyncio.to_thread(excel_store.ensure_ids_setup)
     await asyncio.to_thread(excel_store.ensure_wallet_setup)
+    await asyncio.to_thread(excel_store.ensure_wallet_ids_setup)
     await app.bot.set_my_commands(_BOT_COMMANDS)
     logger.info("Меню команд зарегистрировано.")
 

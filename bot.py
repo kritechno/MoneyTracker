@@ -693,6 +693,24 @@ async def _exchange_reply(msg, pairs) -> None:
     await msg.reply_text(text, reply_markup=_exchange_primary_kb("applied", gave, received))
 
 
+async def _maybe_handle_exchange(msg, text) -> bool:
+    """Если текст/подпись — реальный обмен валюты, двигает кошелёк и возвращает True.
+    Это та же логика, что и в обработчике обычного текста, вынесенная отдельно,
+    чтобы обмен, присланный подписью к фото, не записывался как трата."""
+    if not text or not _ACTION_RE.search(text):
+        return False
+    pairs = await asyncio.to_thread(currency.parse_amounts, text)
+    kind = _action_kind(pairs)
+    if kind == "exchange":
+        await _exchange_reply(msg, pairs)
+        return True
+    if kind == "ask":
+        # Недописанный обмен: не пишем трату-призрак, просим явный формат.
+        await msg.reply_text(_EXCHANGE_HELP)
+        return True
+    return False
+
+
 async def _record_expense(msg, text, success_note="", no_amount_msg=None) -> None:
     """Записывает трату из обычного текста или подписи к фото."""
     await msg.chat.send_action(ChatAction.TYPING)
@@ -737,6 +755,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text("⚠️ Не смог сохранить фото. Пришли его ещё раз.")
         return
     if caption:
+        # Подпись вида «поменял 300 usd на 2775 tjs» — это обмен, а не трата:
+        # двигаем кошелёк, фото уже сохранено в чеки выше.
+        if await _maybe_handle_exchange(msg, caption):
+            return
         await _record_expense(
             msg,
             caption,
@@ -1003,17 +1025,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _apply_set_balance(update, context)
         return
     # Реальный обмен: глагол действия + минимум две суммы → двигаем кошелёк.
-    if _ACTION_RE.search(text):
-        pairs = await asyncio.to_thread(currency.parse_amounts, text)
-        kind = _action_kind(pairs)
-        if kind == "exchange":
-            await _exchange_reply(msg, pairs)
-            return
-        if kind == "ask":
-            # Недописанный обмен: не пишем трату-призрак, просим явный формат.
-            await msg.reply_text(_EXCHANGE_HELP)
-            return
-        # kind == "expense": валюты не было — это обычная трата, пишем как обычно.
+    # Иначе («поменял колесо 5000» без второй валюты) — обычная трата.
+    if await _maybe_handle_exchange(msg, text):
+        return
     await _record_expense(msg, msg.text)
 
 

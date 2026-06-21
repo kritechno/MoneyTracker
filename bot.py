@@ -612,7 +612,7 @@ def _rate_line(gave_amt, gave_cur, recv_amt, recv_cur) -> str:
     return f"1 {recv_cur} = {rate:,.2f} {gave_cur}"
 
 
-def _format_exchange(gave, received) -> str:
+def _format_exchange(gave, received, applied: bool = True) -> str:
     gave_amt, gave_cur = gave
     recv_amt, recv_cur = received
     gave_label = CURRENCY_LABELS.get(gave_cur, gave_cur)
@@ -622,22 +622,28 @@ def _format_exchange(gave, received) -> str:
     diff = round(recv_amt - market_recv, 2)
     pct = (diff / market_recv * 100) if market_recv else 0.0
 
+    # applied=False — предпросмотр перед записью: нейтральная формулировка, чтобы
+    # было видно, что обмен ещё не записан в кошелёк.
+    head = "💱 Обмен:" if applied else "💱 Проверь обмен:"
+    give_word = "Отдал:   " if applied else "Отдаёшь:  "
+    recv_word = "Получил: " if applied else "Получаешь:"
     lines = [
-        "💱 Обмен:",
-        f"Отдал:    {gave_amt:,.2f} {gave_cur} ({gave_label})",
-        f"Получил:  {recv_amt:,.2f} {recv_cur} ({recv_label})",
+        head,
+        f"{give_word} {gave_amt:,.2f} {gave_cur} ({gave_label})",
+        f"{recv_word} {recv_amt:,.2f} {recv_cur} ({recv_label})",
         "",
         f"📈 Твой курс:     {_rate_line(gave_amt, gave_cur, recv_amt, recv_cur)}",
         f"📊 Рыночный курс: {_rate_line(gave_amt, gave_cur, market_recv, recv_cur)}",
         "",
     ]
+    got = "получил" if applied else "получишь"
     if diff > 0:
         lines.append(
-            f"✅ Выгодно: получил на {diff:,.2f} {recv_cur} больше рынка (+{pct:.2f}%)"
+            f"✅ Выгодно: {got} на {diff:,.2f} {recv_cur} больше рынка (+{pct:.2f}%)"
         )
     elif diff < 0:
         lines.append(
-            f"❌ Невыгодно: получил на {abs(diff):,.2f} {recv_cur} меньше рынка ({pct:.2f}%)"
+            f"❌ Невыгодно: {got} на {abs(diff):,.2f} {recv_cur} меньше рынка ({pct:.2f}%)"
         )
     else:
         lines.append("➖ Ровно по рыночному курсу.")
@@ -648,6 +654,14 @@ def _ex_cb(tag: str, gave, received) -> str:
     g_amt, g_cur = gave
     r_amt, r_cur = received
     return f"{tag}|{g_cur}|{_fmt_amt(g_amt)}|{r_cur}|{_fmt_amt(r_amt)}"
+
+
+def _exchange_preview_kb(gave, received) -> InlineKeyboardMarkup:
+    """Клавиатура под предпросмотром обмена: деньги двигаются только после явного
+    «Записать», чтобы поймать неверное направление/опечатку до изменения остатка."""
+    yes = InlineKeyboardButton("✅ Записать обмен", callback_data=_ex_cb("exwr", gave, received))
+    no = InlineKeyboardButton("❌ Отмена", callback_data=_ex_cb("excl", gave, received))
+    return InlineKeyboardMarkup([[yes, no]])
 
 
 def _exchange_primary_kb(state: str, gave, received) -> InlineKeyboardMarkup:
@@ -678,19 +692,38 @@ def _exchange_confirm_kb(action: str, gave, received) -> InlineKeyboardMarkup:
 
 
 async def _exchange_reply(msg, pairs) -> None:
-    """Реальный обмен валюты: первая сумма — что отдаю, вторая — что получаю.
-    Списывает отданную, зачисляет полученную, показывает выгоду и кнопку отмены."""
+    """Предпросмотр обмена: первая сумма — что отдаю, вторая — что получаю. Деньги
+    в кошельке НЕ двигаем — показываем выгоду и каким станет остаток, а запись —
+    только после кнопки «Записать обмен» (см. exwr в on_callback)."""
     gave, received = pairs[0], pairs[1]
     g_amt, g_cur = gave
     r_amt, r_cur = received
-    text = _format_exchange(gave, received)
     async with _excel_lock:
-        net = await asyncio.to_thread(
-            excel_store.add_exchange, g_cur, g_amt, r_cur, r_amt
-        )
+        net = await asyncio.to_thread(excel_store.wallet_net)
         t = await asyncio.to_thread(excel_store.compute_totals)
-    text += "\n\n✅ Записал в кошелёк:\n" + _format_wallet(net, t["per_currency"])
-    await msg.reply_text(text, reply_markup=_exchange_primary_kb("applied", gave, received))
+    proj = dict(net)
+    proj[g_cur] = round(proj.get(g_cur, 0.0) - g_amt, 2)
+    proj[r_cur] = round(proj.get(r_cur, 0.0) + r_amt, 2)
+    text = _format_exchange(gave, received, applied=False)
+    text += "\n\n📋 После обмена остаток станет:\n" + _format_wallet(proj, t["per_currency"])
+    await msg.reply_text(text, reply_markup=_exchange_preview_kb(gave, received))
+
+
+def _exchange_help(pairs) -> str:
+    """Подсказка, когда в обмене распознана только одна сторона: показываем, что
+    именно поняли, и просим дописать недостающую сумму с валютой."""
+    if not pairs:
+        return _EXCHANGE_HELP
+    amt, cur = pairs[0]
+    label = CURRENCY_LABELS.get(cur, cur)
+    return (
+        "💱 Похоже на обмен, но я разобрал только одну сторону:\n"
+        f"   {amt:,.2f} {cur} ({label}).\n\n"
+        "Допиши вторую сумму с валютой — что отдал и что получил. Например:\n"
+        "• поменял 300 долларов на 2775 сомони\n"
+        "• обменял 100 долларов 48000 тенге\n\n"
+        "Если это обычная трата — без слова «поменял/обменял», напр. «Шиномонтаж 5000»."
+    )
 
 
 async def _maybe_handle_exchange(msg, text) -> bool:
@@ -705,8 +738,9 @@ async def _maybe_handle_exchange(msg, text) -> bool:
         await _exchange_reply(msg, pairs)
         return True
     if kind == "ask":
-        # Недописанный обмен: не пишем трату-призрак, просим явный формат.
-        await msg.reply_text(_EXCHANGE_HELP)
+        # Недописанный обмен: не пишем трату-призрак, показываем что поняли и просим
+        # дописать недостающую сторону.
+        await msg.reply_text(_exchange_help(pairs))
         return True
     return False
 
@@ -1240,7 +1274,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    if parts[0] in ("exunq", "exapq", "exsa", "exsr", "exap", "exun") and len(parts) == 5:
+    if parts[0] in ("exwr", "excl", "exunq", "exapq", "exsa", "exsr", "exap", "exun") and len(parts) == 5:
         g_cur, r_cur = parts[1], parts[3]
         try:
             g_amt, r_amt = float(parts[2]), float(parts[4])
@@ -1248,6 +1282,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer("Не понял суммы обмена.")
             return
         gave, received = (g_amt, g_cur), (r_amt, r_cur)
+
+        # Предпросмотр: «Записать» проводит обмен впервые, «Отмена» — ничего не пишет.
+        if parts[0] == "excl":
+            await query.answer("Обмен не записан.")
+            await query.edit_message_text(
+                "❌ Обмен не записан.\n"
+                "Пришли заново, если нужно: «поменял 300 долларов на 2775 сомони»."
+            )
+            return
+        if parts[0] == "exwr":
+            async with _excel_lock:
+                net = await asyncio.to_thread(
+                    excel_store.add_exchange, g_cur, g_amt, r_cur, r_amt
+                )
+                t = await asyncio.to_thread(excel_store.compute_totals)
+            text = (
+                _format_exchange(gave, received)
+                + "\n\n✅ Записал в кошелёк:\n"
+                + _format_wallet(net, t["per_currency"])
+            )
+            await query.answer("Записал обмен.")
+            await query.edit_message_text(
+                text, reply_markup=_exchange_primary_kb("applied", gave, received)
+            )
+            return
 
         # Запрос подтверждения и его отмена — только меняем клавиатуру, деньги не
         # трогаем. Реальный обмен/возврат двигает кошелёк только по «exap»/«exun».

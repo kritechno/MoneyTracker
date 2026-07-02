@@ -778,6 +778,8 @@ async def _record_expense(msg, text, success_note="", no_amount_msg=None) -> Non
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Сохраняет фото-чек; трату записывает только из подписи."""
     msg = update.message
+    if msg is None:
+        return
     caption = (msg.caption or "").strip()
     try:
         photo = msg.photo[-1]
@@ -813,6 +815,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Импорт тура: пользователь шлёт .xlsx → имя файла становится названием тура.
     Новый тур создаётся, существующий заменяется (с бэкапом), тур делается активным."""
     msg = update.message
+    if msg is None:
+        return
     await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
     try:
         tg_file = await msg.document.get_file()
@@ -890,6 +894,7 @@ async def _prompt_start_balance(msg, context: ContextTypes.DEFAULT_TYPE) -> None
     context.user_data["awaiting_edit"] = None
     context.user_data["awaiting_profile_name"] = False
     context.user_data.pop("awaiting_wallet_for", None)
+    context.user_data.pop("pending_start_balance", None)
     context.user_data["awaiting_start_balance"] = True
     await msg.reply_text(
         f"📂 Тур: {profile}\n"
@@ -971,6 +976,8 @@ async def _apply_set_balance(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def _apply_start_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Правка начального баланса необратимо затирает прежний «Старт», поэтому
+    сначала показываем «было → станет» и ждём подтверждения кнопкой."""
     msg = update.message
     context.user_data["awaiting_start_balance"] = False
     text = (msg.text or "").strip()
@@ -989,14 +996,23 @@ async def _apply_start_balance(update: Update, context: ContextTypes.DEFAULT_TYP
                 "«0» — обнулить, «-» — отмена."
             )
             return
-    async with _excel_lock:
-        net = await asyncio.to_thread(excel_store.set_start_balance, pairs)
-        start = await asyncio.to_thread(excel_store.get_start_balance)
-        t = await asyncio.to_thread(excel_store.compute_totals)
+    old = await asyncio.to_thread(excel_store.get_start_balance)
+    new = {cur: 0.0 for cur in CURRENCIES}
+    for amount, cur in pairs:
+        if cur in new:
+            new[cur] += float(amount)
+    context.user_data["pending_start_balance"] = pairs
     profile = await asyncio.to_thread(settings.get_active_profile)
     await msg.reply_text(
-        f"✅ Начальный баланс тура «{profile}»: {_format_start_balance(start)}\n\n"
-        + _format_wallet(net, t["per_currency"])
+        f"📂 Тур: {profile}\n"
+        f"Заменить начальный баланс?\n"
+        f"Сейчас: {_format_start_balance(old)}\n"
+        f"Станет: {_format_start_balance(new)}\n\n"
+        "Пополнения и обмены не трону.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, заменить", callback_data="sbok"),
+            InlineKeyboardButton("← Отмена", callback_data="sbno"),
+        ]]),
     )
 
 
@@ -1039,8 +1055,23 @@ async def _apply_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: 
     await msg.reply_text("✅ Обновил трату.")
 
 
+async def handle_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Правки сообщений бот не отслеживает; молчать нельзя — пользователь ждёт,
+    что запись изменится. Подсказываем, как исправить на самом деле."""
+    msg = update.edited_message
+    if msg is None:
+        return
+    await msg.reply_text(
+        "✏️ Правки сообщений не отслеживаю — запись осталась прежней.\n"
+        "Исправить трату: кнопки «Сумма/Описание» под записью, "
+        "удалить: /undo. Или просто пришли новое сообщение."
+    )
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
+    if msg is None:
+        return
     text = msg.text or ""
     edit = context.user_data.get("awaiting_edit")
     if edit:
@@ -1112,6 +1143,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.message.reply_text(
             "📂 Пришли название нового тура одним сообщением "
             "(например «Италия 2026» или «Тур 2027»)."
+        )
+        return
+
+    if parts[0] in ("sbok", "sbno"):
+        if not await asyncio.to_thread(_is_admin, query.from_user.id):
+            await query.answer("⛔️ Менять баланс может только владелец.", show_alert=True)
+            return
+        pending = context.user_data.pop("pending_start_balance", None)
+        if parts[0] == "sbno":
+            await query.answer()
+            await query.edit_message_text("Ок, начальный баланс не меняю.")
+            return
+        if pending is None:
+            await query.answer(
+                "Это подтверждение устарело. Начни заново: /startbalance",
+                show_alert=True,
+            )
+            try:
+                await query.edit_message_reply_markup(None)
+            except BadRequest:
+                pass
+            return
+        async with _excel_lock:
+            net = await asyncio.to_thread(excel_store.set_start_balance, pending)
+            start = await asyncio.to_thread(excel_store.get_start_balance)
+            t = await asyncio.to_thread(excel_store.compute_totals)
+        profile = await asyncio.to_thread(settings.get_active_profile)
+        await query.answer("Готово")
+        await query.edit_message_text(
+            f"✅ Начальный баланс тура «{profile}»: {_format_start_balance(start)}\n\n"
+            + _format_wallet(net, t["per_currency"])
         )
         return
 
@@ -1582,6 +1644,9 @@ def main() -> None:
     app.add_handler(CommandHandler("allowed", allowed_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
+    # Правки сообщений перехватываем раньше остальных, иначе они падают в
+    # обычные хендлеры, где update.message is None.
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, handle_edited))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.FileExtension("xlsx"), handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

@@ -2,10 +2,12 @@ import asyncio
 import logging
 import os
 import re
+import time
 from datetime import date, timedelta
 
 from telegram import (
     BotCommand,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
@@ -47,6 +49,36 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("moneytracker")
 
 _excel_lock = asyncio.Lock()
+
+# Режим «жду следующее сообщение» (имя тура, баланс, правка суммы/описания).
+# Один на пользователя, живёт _MODE_TTL секунд, промпт уходит с ForceReply.
+# Иначе забытая кнопка молча проглатывает обычную трату (так однажды случайное
+# сообщение затёрло начальный баланс тура).
+_MODE_TTL = 300
+
+
+def _arm_mode(context, kind: str, data=None, prompt_id: int | None = None) -> None:
+    context.user_data["mode"] = {
+        "kind": kind,
+        "data": data,
+        "ts": time.monotonic(),
+        "prompt_id": prompt_id,
+    }
+
+
+def _take_mode(context, msg) -> dict | None:
+    """Снимает и возвращает активный режим, если сообщение к нему относится:
+    прямой ответ на промпт — всегда, любое другое сообщение — пока режим свеж.
+    Просроченный режим сбрасывается, сообщение уходит в обычную обработку."""
+    mode = context.user_data.get("mode")
+    if not mode:
+        return None
+    context.user_data["mode"] = None
+    reply = getattr(msg, "reply_to_message", None)
+    is_reply = reply is not None and reply.message_id == mode.get("prompt_id")
+    if not is_reply and time.monotonic() - mode["ts"] > _MODE_TTL:
+        return None
+    return mode
 
 
 class _NoAmount(Exception):
@@ -140,23 +172,48 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
 
-START_TEXT = (
-    "👋 Я веду учёт трат по турам.\n\n"
-    "Записать трату — просто напиши строкой:\n"
-    "• Ресторан Нават 50000 тенге\n"
-    "• Такси 1200\n"
-    "• Заправка 30 долларов\n\n"
-    "Фото чека приложи с подписью «Ресторан Нават 50000 тенге» — фото сохраню, "
-    "трату запишу по подписи.\n\n"
-    "После записи кнопками меняешь категорию, сумму, описание или удаляешь трату.\n\n"
-    "Главное:\n"
-    "/total — сводка по туру\n"
-    "/wallet — остаток кошелька\n"
-    "/add 5000 USD — пополнить кошелёк\n"
-    "/profiles — выбрать или создать тур\n"
-    "/excel — выгрузить файл тура\n"
-    "/help — все команды"
-)
+# Онбординг: короткие страницы с кнопками «Далее/Назад» вместо простыни текста.
+_ONB_PAGES = [
+    (
+        "👋 Я веду учёт трат по турам.\n\n"
+        "✍️ Записать трату — просто напиши строкой:\n"
+        "• Такси 1200\n"
+        "• Ресторан Нават 50000 тенге\n"
+        "• Заправка 30 долларов\n\n"
+        "Без валюты возьму валюту по умолчанию (сменить: /currency).\n"
+        "Под каждой записью появятся кнопки — там меняешь категорию, "
+        "сумму, описание или удаляешь."
+    ),
+    (
+        "📂 Туры и кошелёк\n\n"
+        "Каждый тур — отдельный учёт: /profiles — выбрать или создать.\n\n"
+        "💼 Кошелёк считает наличку по валютам:\n"
+        "• /add 5000 USD — пополнить\n"
+        "• «поменял 67 долларов 5360 сом» — обмен валюты\n"
+        "• /wallet — остаток, /total — сводка трат\n\n"
+        "Каждая трата уменьшает остаток — видно, сколько денег осталось."
+    ),
+    (
+        "🛠 Исправления и чеки\n\n"
+        "• Ошибся? Отредактируй своё сообщение — трата обновится.\n"
+        "• Или кнопки «✏️ Сумма/Описание» под записью.\n"
+        "• /undo — удалить последнюю трату.\n\n"
+        "📸 Фото чека с подписью «Ресторан 4500 тенге» — сохраню фото "
+        "и запишу трату. Без подписи — просто сохраню в чеки.\n\n"
+        "/excel — выгрузить файл тура, /help — все команды."
+    ),
+]
+
+
+def _onb_keyboard(page: int) -> InlineKeyboardMarkup:
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("◀️ Назад", callback_data=f"onb|{page - 1}"))
+    if page < len(_ONB_PAGES) - 1:
+        row.append(InlineKeyboardButton("Далее ▶️", callback_data=f"onb|{page + 1}"))
+    else:
+        row.append(InlineKeyboardButton("✅ Понятно", callback_data="onb|done"))
+    return InlineKeyboardMarkup([row])
 
 HELP_TEXT = (
     "ℹ️ Как пользоваться\n\n"
@@ -165,7 +222,8 @@ HELP_TEXT = (
     "• Такси 1200\n"
     "• Заправка 30 долларов\n\n"
     "Фото чека: добавь подпись с суммой. Без подписи фото только сохранится в чеки.\n"
-    "Обмен валюты: «поменял 67 долларов 5360 сом».\n\n"
+    "Обмен валюты: «поменял 67 долларов 5360 сом».\n"
+    "Ошибся? Отредактируй своё сообщение — трата обновится.\n\n"
     "Команды:\n"
     "/total — сводка по туру за всё время\n"
     "/total месяц — период: сегодня, неделя, месяц, год или число дней\n"
@@ -250,7 +308,10 @@ async def _process(text):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(START_TEXT)
+    await update.message.reply_text(
+        f"{_ONB_PAGES[0]}\n\n· 1/{len(_ONB_PAGES)} ·",
+        reply_markup=_onb_keyboard(0),
+    )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -745,7 +806,7 @@ async def _maybe_handle_exchange(msg, text) -> bool:
     return False
 
 
-async def _record_expense(msg, text, success_note="", no_amount_msg=None) -> None:
+async def _record_expense(msg, text, success_note="", no_amount_msg=None, context=None) -> None:
     """Записывает трату из обычного текста или подписи к фото."""
     await msg.chat.send_action(ChatAction.TYPING)
     try:
@@ -770,9 +831,15 @@ async def _record_expense(msg, text, success_note="", no_amount_msg=None) -> Non
     reply = _format_reply(entry)
     if success_note:
         reply += "\n\n" + success_note
-    await msg.reply_text(
+    sent = await msg.reply_text(
         reply, reply_markup=_expense_keyboard(expense_id, entry["category"])
     )
+    if context is not None:
+        # Помним, из какого сообщения родилась трата: правка сообщения обновит её.
+        seen = context.chat_data.setdefault("msg_expense", {})
+        seen[msg.message_id] = {"expense_id": expense_id, "reply_id": sent.message_id}
+        while len(seen) > 100:
+            seen.pop(next(iter(seen)))
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -803,6 +870,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "📎 Фото сохранено. Чтобы записать трату, добавь сумму в подпись: "
                 "«Ресторан Нават 50000 тенге»."
             ),
+            context=context,
         )
     else:
         await msg.reply_text(
@@ -839,9 +907,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def _create_profile_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Имя нового тура пришло сообщением — просим подтвердить кнопкой, чтобы
+    случайный текст (например трата «Закуп 2502») не становился туром."""
     msg = update.message
     name = (msg.text or "").strip()
-    context.user_data["awaiting_profile_name"] = False
     if not name:
         await msg.reply_text("Название пустое. Создать тур заново: /profiles")
         return
@@ -849,21 +918,18 @@ async def _create_profile_flow(update: Update, context: ContextTypes.DEFAULT_TYP
         await asyncio.to_thread(settings.set_active_profile, name)
         await msg.reply_text(f"📂 Тур «{name}» уже есть — сделал его активным.")
         return
-    async with _excel_lock:
-        await asyncio.to_thread(excel_store.create_profile, name)
-        await asyncio.to_thread(settings.set_active_profile, name)
-    context.user_data["awaiting_wallet_for"] = name
+    context.user_data["pending_profile_name"] = name
     await msg.reply_text(
-        f"✅ Тур «{name}» создан (отдельный файл) и активирован.\n\n"
-        "Начальный баланс кошелька можно указать одним сообщением:\n"
-        "«1460000 тенге 7000 долларов»\n\n"
-        "Чтобы пропустить, напиши «-»."
+        f"Создать новый тур «{name}»?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, создать", callback_data="profnew_ok"),
+            InlineKeyboardButton("← Отмена", callback_data="profnew_no"),
+        ]]),
     )
 
 
-async def _start_balance_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _start_balance_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, name) -> None:
     msg = update.message
-    name = context.user_data.pop("awaiting_wallet_for", None)
     if not name:
         return
     text = (msg.text or "").strip()
@@ -891,18 +957,16 @@ async def _prompt_start_balance(msg, context: ContextTypes.DEFAULT_TYPE) -> None
     """Показывает текущий начальный баланс активного профиля и ждёт новый."""
     profile = await asyncio.to_thread(settings.get_active_profile)
     start = await asyncio.to_thread(excel_store.get_start_balance)
-    context.user_data["awaiting_edit"] = None
-    context.user_data["awaiting_profile_name"] = False
-    context.user_data.pop("awaiting_wallet_for", None)
     context.user_data.pop("pending_start_balance", None)
-    context.user_data["awaiting_start_balance"] = True
-    await msg.reply_text(
+    sent = await msg.reply_text(
         f"📂 Тур: {profile}\n"
         f"Текущий начальный баланс: {_format_start_balance(start)}\n\n"
-        "Пришли правильный начальный баланс одним сообщением:\n"
+        "Ответь на это сообщение правильным начальным балансом:\n"
         "«1460000 тенге 7000 долларов»\n\n"
-        "«0» — обнулить, «-» — отмена. Пополнения и обмены не трону."
+        "«0» — обнулить, «-» — отмена. Пополнения и обмены не трону.",
+        reply_markup=ForceReply(input_field_placeholder="Начальный баланс"),
     )
+    _arm_mode(context, "start_balance", prompt_id=sent.message_id)
 
 
 async def start_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -923,18 +987,15 @@ async def _prompt_set_balance(msg, context: ContextTypes.DEFAULT_TYPE) -> None:
     shown = ", ".join(
         f"{bal[c]:,.0f} {c}" for c in CURRENCIES if bal[c] or net.get(c)
     ) or "пусто"
-    context.user_data["awaiting_edit"] = None
-    context.user_data["awaiting_profile_name"] = False
-    context.user_data.pop("awaiting_wallet_for", None)
-    context.user_data["awaiting_start_balance"] = False
-    context.user_data["awaiting_set_balance"] = True
-    await msg.reply_text(
+    sent = await msg.reply_text(
         f"📂 Тур: {profile}\n"
         f"Текущий остаток: {shown}\n\n"
-        "Пришли нужный остаток одним сообщением:\n"
+        "Ответь на это сообщение нужным остатком:\n"
         "«164000 тенге» или «164000 тенге 4405 долларов»\n\n"
-        "Запишу корректировку, чтобы остаток стал ровно таким. «-» — отмена."
+        "Запишу корректировку, чтобы остаток стал ровно таким. «-» — отмена.",
+        reply_markup=ForceReply(input_field_placeholder="Нужный остаток"),
     )
+    _arm_mode(context, "set_balance", prompt_id=sent.message_id)
 
 
 async def set_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -947,7 +1008,6 @@ async def set_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def _apply_set_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
-    context.user_data["awaiting_set_balance"] = False
     user = update.effective_user
     if user is None or not await asyncio.to_thread(_is_admin, user.id):
         await msg.reply_text("⛔️ Менять баланс может только владелец бота.")
@@ -958,11 +1018,12 @@ async def _apply_set_balance(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     pairs = await asyncio.to_thread(currency.parse_amounts, text)
     if not pairs:
-        context.user_data["awaiting_set_balance"] = True  # дать повторить ввод
-        await msg.reply_text(
+        sent = await msg.reply_text(
             "Не понял сумму. Пример: «164000 тенге» или «164000 тенге 4405 долларов».\n"
-            "«-» — отмена."
+            "«-» — отмена.",
+            reply_markup=ForceReply(input_field_placeholder="Нужный остаток"),
         )
+        _arm_mode(context, "set_balance", prompt_id=sent.message_id)  # дать повторить
         return
     async with _excel_lock:
         net = await asyncio.to_thread(excel_store.set_balance, pairs)
@@ -979,7 +1040,6 @@ async def _apply_start_balance(update: Update, context: ContextTypes.DEFAULT_TYP
     """Правка начального баланса необратимо затирает прежний «Старт», поэтому
     сначала показываем «было → станет» и ждём подтверждения кнопкой."""
     msg = update.message
-    context.user_data["awaiting_start_balance"] = False
     text = (msg.text or "").strip()
     low = text.lower()
     if low in {"-", "отмена", "нет", "cancel", "пропустить", "skip"}:
@@ -990,11 +1050,12 @@ async def _apply_start_balance(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         pairs = await asyncio.to_thread(currency.parse_amounts, text)
         if not pairs:
-            context.user_data["awaiting_start_balance"] = True  # дать повторить ввод
-            await msg.reply_text(
+            sent = await msg.reply_text(
                 "Не понял сумму. Пример: «1460000 тенге 7000 долларов».\n"
-                "«0» — обнулить, «-» — отмена."
+                "«0» — обнулить, «-» — отмена.",
+                reply_markup=ForceReply(input_field_placeholder="Начальный баланс"),
             )
+            _arm_mode(context, "start_balance", prompt_id=sent.message_id)  # повторить
             return
     old = await asyncio.to_thread(excel_store.get_start_balance)
     new = {cur: 0.0 for cur in CURRENCIES}
@@ -1018,13 +1079,16 @@ async def _apply_start_balance(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _apply_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: dict) -> None:
     msg = update.message
-    context.user_data["awaiting_edit"] = None
     expense_id, field = edit["id"], edit["field"]
     text = (msg.text or "").strip()
     if field == "amt":
         parsed = await asyncio.to_thread(currency.parse_single_amount, text)
         if parsed is None or parsed[0] <= 0:
-            await msg.reply_text("Нужно положительное число: «4500» или «30 долларов».")
+            sent = await msg.reply_text(
+                "Нужно положительное число: «4500» или «30 долларов».",
+                reply_markup=ForceReply(input_field_placeholder="Новая сумма"),
+            )
+            _arm_mode(context, "edit", data=edit, prompt_id=sent.message_id)
             return
         amount, cur = parsed
         async with _excel_lock:
@@ -1033,7 +1097,11 @@ async def _apply_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: 
             )
     else:
         if not text:
-            await msg.reply_text("Описание пустое. Пришли новый текст одним сообщением.")
+            sent = await msg.reply_text(
+                "Описание пустое. Пришли новый текст одним сообщением.",
+                reply_markup=ForceReply(input_field_placeholder="Новое описание"),
+            )
+            _arm_mode(context, "edit", data=edit, prompt_id=sent.message_id)
             return
         async with _excel_lock:
             entry = await asyncio.to_thread(
@@ -1056,16 +1124,53 @@ async def _apply_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: 
 
 
 async def handle_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Правки сообщений бот не отслеживает; молчать нельзя — пользователь ждёт,
-    что запись изменится. Подсказываем, как исправить на самом деле."""
+    """Правка сообщения, из которого родилась трата, обновляет саму трату —
+    это то, чего интуитивно ждёт пользователь. Для остальных правок — подсказка."""
     msg = update.edited_message
     if msg is None:
         return
-    await msg.reply_text(
-        "✏️ Правки сообщений не отслеживаю — запись осталась прежней.\n"
+    hint = (
+        "✏️ Эту правку не отслеживаю — запись осталась прежней.\n"
         "Исправить трату: кнопки «Сумма/Описание» под записью, "
         "удалить: /undo. Или просто пришли новое сообщение."
     )
+    info = context.chat_data.get("msg_expense", {}).get(msg.message_id)
+    text = (msg.text or msg.caption or "").strip()
+    if info is None or not text:
+        await msg.reply_text(hint)
+        return
+    # Только быстрый парсер: правка должна вести себя предсказуемо, без Gemini.
+    default_cur = await asyncio.to_thread(settings.get_default_currency)
+    parsed = await asyncio.to_thread(expense_parser.parse_expense, text, default_cur)
+    if not parsed.parsed or not parsed.entry.get("amount") or parsed.entry["amount"] <= 0:
+        await msg.reply_text(
+            "✏️ Не понял правку — запись осталась прежней.\n"
+            "Нужны описание и сумма, например: «Такси 1500 сом»."
+        )
+        return
+    data = parsed.entry
+    async with _excel_lock:
+        entry = await asyncio.to_thread(
+            excel_store.update_amount, info["expense_id"], data["amount"], data["currency"]
+        )
+        if entry is not None and data.get("description"):
+            entry = await asyncio.to_thread(
+                excel_store.update_description, info["expense_id"], data["description"]
+            )
+    if entry is None:
+        await msg.reply_text("Эта трата уже удалена — правка не применена.")
+        return
+    await _enrich(entry)
+    try:
+        await context.bot.edit_message_text(
+            _format_reply(entry) + "\n\n✏️ Обновлено по правке сообщения.",
+            chat_id=msg.chat_id,
+            message_id=info["reply_id"],
+            reply_markup=_expense_keyboard(info["expense_id"], entry["category"]),
+        )
+    except BadRequest:
+        # Ответ бота мог быть удалён — подтверждаем правку новым сообщением.
+        await msg.reply_text("✅ Обновил трату:\n" + _format_reply(entry))
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1073,27 +1178,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if msg is None:
         return
     text = msg.text or ""
-    edit = context.user_data.get("awaiting_edit")
-    if edit:
-        await _apply_edit(update, context, edit)
-        return
-    if context.user_data.get("awaiting_profile_name"):
-        await _create_profile_flow(update, context)
-        return
-    if context.user_data.get("awaiting_wallet_for"):
-        await _start_balance_flow(update, context)
-        return
-    if context.user_data.get("awaiting_start_balance"):
-        await _apply_start_balance(update, context)
-        return
-    if context.user_data.get("awaiting_set_balance"):
-        await _apply_set_balance(update, context)
+    mode = _take_mode(context, msg)
+    if mode is not None:
+        kind = mode["kind"]
+        if kind == "edit":
+            await _apply_edit(update, context, mode["data"])
+        elif kind == "profile_name":
+            await _create_profile_flow(update, context)
+        elif kind == "wallet_for":
+            await _start_balance_flow(update, context, mode["data"])
+        elif kind == "start_balance":
+            await _apply_start_balance(update, context)
+        elif kind == "set_balance":
+            await _apply_set_balance(update, context)
         return
     # Реальный обмен: глагол действия + минимум две суммы → двигаем кошелёк.
     # Иначе («поменял колесо 5000» без второй валюты) — обычная трата.
     if await _maybe_handle_exchange(msg, text):
         return
-    await _record_expense(msg, msg.text)
+    await _record_expense(msg, msg.text, context=context)
 
 
 async def undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1138,12 +1241,69 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if parts[0] == "prof_new":
-        context.user_data["awaiting_profile_name"] = True
         await query.answer()
-        await query.message.reply_text(
-            "📂 Пришли название нового тура одним сообщением "
-            "(например «Италия 2026» или «Тур 2027»)."
+        sent = await query.message.reply_text(
+            "📂 Ответь на это сообщение названием нового тура "
+            "(например «Италия 2026» или «Тур 2027»).",
+            reply_markup=ForceReply(input_field_placeholder="Название тура"),
         )
+        _arm_mode(context, "profile_name", prompt_id=sent.message_id)
+        return
+
+    if parts[0] in ("profnew_ok", "profnew_no"):
+        name = context.user_data.pop("pending_profile_name", None)
+        if parts[0] == "profnew_no":
+            await query.answer()
+            await query.edit_message_text("Ок, тур не создаю.")
+            return
+        if not name:
+            await query.answer(
+                "Это подтверждение устарело. Создать тур: /profiles",
+                show_alert=True,
+            )
+            try:
+                await query.edit_message_reply_markup(None)
+            except BadRequest:
+                pass
+            return
+        async with _excel_lock:
+            await asyncio.to_thread(excel_store.create_profile, name)
+            await asyncio.to_thread(settings.set_active_profile, name)
+        await query.answer()
+        await query.edit_message_text(
+            f"✅ Тур «{name}» создан (отдельный файл) и активирован."
+        )
+        sent = await query.message.reply_text(
+            "Начальный баланс кошелька можно указать ответом на это сообщение:\n"
+            "«1460000 тенге 7000 долларов»\n\n"
+            "Чтобы пропустить, напиши «-».",
+            reply_markup=ForceReply(input_field_placeholder="Начальный баланс или «-»"),
+        )
+        _arm_mode(context, "wallet_for", data=name, prompt_id=sent.message_id)
+        return
+
+    if parts[0] == "onb" and len(parts) == 2:
+        if parts[1] == "done":
+            await query.answer("Удачного тура! 🚀")
+            try:
+                await query.edit_message_reply_markup(None)
+            except BadRequest:
+                pass
+            return
+        try:
+            page = int(parts[1])
+            body = _ONB_PAGES[page]
+        except (ValueError, IndexError):
+            await query.answer()
+            return
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                f"{body}\n\n· {page + 1}/{len(_ONB_PAGES)} ·",
+                reply_markup=_onb_keyboard(page),
+            )
+        except BadRequest:
+            pass
         return
 
     if parts[0] in ("sbok", "sbno"):
@@ -1484,18 +1644,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if current is None:
             await query.answer("Трата не найдена (возможно, удалена).")
             return
-        context.user_data["awaiting_edit"] = {
-            "id": expense_id,
-            "field": field,
-            "chat_id": query.message.chat_id,
-            "message_id": query.message.message_id,
-        }
         await query.answer()
-        await query.message.reply_text(
-            "✏️ Пришли новую сумму одним сообщением: «4500» (та же валюта) "
+        sent = await query.message.reply_text(
+            "✏️ Ответь на это сообщение новой суммой: «4500» (та же валюта) "
             "или «30 долларов» (со сменой валюты)."
             if field == "amt"
-            else "✏️ Пришли новое описание одним сообщением."
+            else "✏️ Ответь на это сообщение новым описанием.",
+            reply_markup=ForceReply(
+                input_field_placeholder="Новая сумма" if field == "amt" else "Новое описание"
+            ),
+        )
+        _arm_mode(
+            context,
+            "edit",
+            data={
+                "id": expense_id,
+                "field": field,
+                "chat_id": query.message.chat_id,
+                "message_id": query.message.message_id,
+            },
+            prompt_id=sent.message_id,
         )
         return
 

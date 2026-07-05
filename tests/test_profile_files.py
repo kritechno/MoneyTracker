@@ -85,6 +85,22 @@ class ProfileFilesTest(unittest.TestCase):
         self.assertEqual(totals["per_currency"]["KZT"], 1000)
         self.assertEqual(self.store.wallet_net()["KZT"], 5000.0)
 
+    def test_compute_totals_up_to_id_excludes_later_expenses(self):
+        # Остаток «на момент траты»: смена категории у старой записи не должна
+        # подмешивать в её ответ траты, записанные позже.
+        self._add("Закуп", 3160, "KGS")   # id 1
+        self._add("Бензин", 5592, "KGS")  # id 2
+        self._add("Газ", 4161, "KGS")     # id 3
+        self.assertEqual(
+            self.store.compute_totals(up_to_id=1)["per_currency"]["KGS"], 3160
+        )
+        self.assertEqual(
+            self.store.compute_totals(up_to_id=2)["per_currency"]["KGS"], 8752
+        )
+        self.assertEqual(
+            self.store.compute_totals()["per_currency"]["KGS"], 12913
+        )
+
     def test_import_creates_then_replaces_with_backup(self):
         name, replaced = self.store.import_profile_from_upload(
             "Greece 2026.xlsx", _upload_bytes([("Гирос", 10, "USD", "Питание", 10, 1)])

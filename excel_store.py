@@ -285,9 +285,11 @@ def _coerce_date(value):
     return None
 
 
-def _aggregate(ws, since: date | None = None) -> dict:
+def _aggregate(ws, since: date | None = None, up_to_id: int | None = None) -> dict:
     """Суммирует строки листа расходов в готовые числа (без формул Excel).
-    since — нижняя граница даты включительно (для периодных сводок)."""
+    since — нижняя граница даты включительно (для периодных сводок).
+    up_to_id — учитывать только траты с id не больше указанного: так остаток
+    в ответе на старую трату не включает записанные позже."""
     per_currency = {cur: 0.0 for cur in CURRENCIES}
     per_category = {cat: 0.0 for cat in CATEGORIES}
     total_usd = 0.0
@@ -299,6 +301,10 @@ def _aggregate(ws, since: date | None = None) -> dict:
         if since is not None:
             d = _coerce_date(row[0])
             if d is None or d < since:
+                continue
+        if up_to_id is not None:
+            rid = row[_ID_COL - 1] if len(row) >= _ID_COL else None
+            if isinstance(rid, int) and rid > up_to_id:
                 continue
         count += 1
         if cur in per_currency and isinstance(amount, (int, float)):
@@ -366,9 +372,10 @@ def _rebuild_summary(
         row += 1
 
 
-def compute_totals(since: date | None = None) -> dict:
+def compute_totals(since: date | None = None, up_to_id: int | None = None) -> dict:
     """Считает итоги по активному туру: суммы по валютам, общую в USD и суммы по
-    категориям (в USD). since — нижняя граница даты включительно."""
+    категориям (в USD). since — нижняя граница даты включительно.
+    up_to_id — только траты с id не больше указанного (остаток «на момент траты»)."""
     empty = {
         "per_currency": {cur: 0.0 for cur in CURRENCIES},
         "per_category": {cat: 0.0 for cat in CATEGORIES},
@@ -381,7 +388,7 @@ def compute_totals(since: date | None = None) -> dict:
     wb = load_workbook(path, data_only=True)
     if DATA_SHEET not in wb.sheetnames:
         return empty
-    return _aggregate(wb[DATA_SHEET], since)
+    return _aggregate(wb[DATA_SHEET], since, up_to_id)
 
 
 def add_expense(entry: dict) -> int:

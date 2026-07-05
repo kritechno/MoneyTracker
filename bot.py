@@ -276,9 +276,13 @@ def _expense_keyboard(expense_id: int, current_category: str) -> InlineKeyboardM
 
 
 async def _enrich(entry: dict) -> dict:
-    """Дополняет трату полями кошелька/профиля для _format_reply."""
+    """Дополняет трату полями кошелька/профиля для _format_reply.
+    «Осталось» считается на момент этой траты (по id): смена категории или
+    правка старой записи не должна подставлять в её ответ текущий остаток."""
     net = await asyncio.to_thread(excel_store.wallet_net)
-    totals = await asyncio.to_thread(excel_store.compute_totals)
+    totals = await asyncio.to_thread(
+        excel_store.compute_totals, None, entry.get("id")
+    )
     cur = entry["currency"]
     entry["profile"] = await asyncio.to_thread(settings.get_active_profile)
     entry["has_wallet"] = any(net.values())

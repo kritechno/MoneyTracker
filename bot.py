@@ -1426,6 +1426,64 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await _prompt_start_balance(query.message, context)
         return
 
+    if parts[0] in ("asg_menu", "asg", "asgu"):
+        if not await asyncio.to_thread(_is_admin, query.from_user.id):
+            await query.answer(
+                "⛔️ Назначать владельцев туров может только владелец бота.",
+                show_alert=True,
+            )
+            return
+        viewer = query.from_user.id
+        names = await asyncio.to_thread(settings.list_profiles)
+
+        if parts[0] == "asg_menu":
+            text, kb = await _assign_list_text_kb(viewer)
+            await query.answer()
+            await query.edit_message_text(text, reply_markup=kb)
+            return
+
+        try:
+            name = names[int(parts[1])]
+        except (ValueError, IndexError):
+            await query.answer("Тур не найден.")
+            return
+
+        if parts[0] == "asg":
+            owner = await asyncio.to_thread(settings.profile_owner, name)
+            rows = []
+            for uid in _known_user_ids():
+                mark = "✅ " if uid == owner else ""
+                is_admin = await asyncio.to_thread(_is_admin, uid)
+                role = "админ" if is_admin else "гид"
+                rows.append([InlineKeyboardButton(
+                    f"{mark}{uid} ({role})", callback_data=f"asgu|{parts[1]}|{uid}"
+                )])
+            rows.append([InlineKeyboardButton(
+                "🚫 Снять владельца", callback_data=f"asgu|{parts[1]}|none")])
+            rows.append([InlineKeyboardButton("← Назад", callback_data="asg_menu")])
+            await query.answer()
+            await query.edit_message_text(
+                f"👤 Тур «{name}»\nСейчас владелец: {_owner_label(owner, viewer)}\n\n"
+                "Кому назначить?",
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return
+
+        # asgu|<index>|<uid|none> — записываем владельца
+        raw = parts[2] if len(parts) > 2 else ""
+        new_uid = None if raw == "none" else (int(raw) if raw.isdigit() else None)
+        if raw != "none" and new_uid is None:
+            await query.answer("Не понял пользователя.")
+            return
+        await asyncio.to_thread(settings.set_profile_owner, name, new_uid)
+        text, kb = await _assign_list_text_kb(viewer)
+        await query.answer("Готово")
+        await query.edit_message_text(
+            f"✅ Тур «{name}» → {_owner_label(new_uid, viewer)}\n\n" + text,
+            reply_markup=kb,
+        )
+        return
+
     if parts[0] == "prof" and len(parts) == 2:
         names = await _visible_profiles(query.from_user)
         try:
@@ -1760,6 +1818,51 @@ def _parse_user_ids(args) -> list[int]:
     return ids
 
 
+def _known_user_ids() -> list[int]:
+    """Все известные боту пользователи: админы из .env, владелец и гиды из /allow."""
+    ids: list[int] = list(ALLOWED_USER_IDS)
+    owner = settings.get_owner_id()
+    if owner is not None and owner not in ids:
+        ids.append(owner)
+    for uid in sorted(settings.get_allowed_user_ids()):
+        if uid not in ids:
+            ids.append(uid)
+    return ids
+
+
+def _owner_label(uid: int | None, viewer: int | None = None) -> str:
+    if uid is None:
+        return "— ничей"
+    return f"{uid}" + (" (я)" if viewer is not None and uid == viewer else "")
+
+
+async def _assign_list_text_kb(viewer: int):
+    """Экран /assign: туры с их владельцами."""
+    names = await asyncio.to_thread(settings.list_profiles)
+    rows, lines = [], []
+    for i, name in enumerate(names):
+        owner = await asyncio.to_thread(settings.profile_owner, name)
+        lines.append(f"• {name} → {_owner_label(owner, viewer)}")
+        rows.append([InlineKeyboardButton(f"{name}", callback_data=f"asg|{i}")])
+    text = (
+        "👤 Владельцы туров\n\n" + "\n".join(lines)
+        + "\n\nВладелец тура видит его в /profiles. Ты как админ видишь все туры.\n"
+        "Выбери тур, чтобы сменить владельца:"
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def assign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Только админу: назначить владельца тура (кому он виден в /profiles)."""
+    msg = update.message
+    user = update.effective_user
+    if user is None or not await asyncio.to_thread(_is_admin, user.id):
+        await msg.reply_text("⛔️ Назначать владельцев туров может только владелец бота.")
+        return
+    text, kb = await _assign_list_text_kb(user.id)
+    await msg.reply_text(text, reply_markup=kb)
+
+
 async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Владелец открывает доступ другим пользователям по Telegram-id."""
     msg = update.message
@@ -1885,6 +1988,7 @@ def main() -> None:
     app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("startbalance", start_balance_cmd))
     app.add_handler(CommandHandler("setbalance", set_balance_cmd))
+    app.add_handler(CommandHandler("assign", assign_cmd))  # админская, нет в /help и меню
     app.add_handler(CommandHandler("allow", allow_cmd))
     app.add_handler(CommandHandler("disallow", disallow_cmd))
     app.add_handler(CommandHandler("allowed", allowed_cmd))

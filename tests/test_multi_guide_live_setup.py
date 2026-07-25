@@ -105,6 +105,25 @@ class MultiGuideLiveSetupTest(unittest.TestCase):
         self.assertIsNone(self.s.get_active_profile(GUIDE))
         self.assertEqual(asyncio.run(self.bot._visible_profiles(_user(GUIDE))), [])
 
+    def test_assign_makes_tour_visible_to_guide_and_keeps_owner_view(self):
+        # Админ отдаёт существующий тур гиду — тур появляется у гида, админ видит всё.
+        self.s.set_profile_owner("Дни в Бишкеке", GUIDE)
+        self.assertEqual(
+            asyncio.run(self.bot._visible_profiles(_user(GUIDE))), ["Дни в Бишкеке"]
+        )
+        owner_view = asyncio.run(self.bot._visible_profiles(_user(OWNER)))
+        self.assertIn("Дни в Бишкеке", owner_view)
+        self.assertEqual(len(owner_view), len(TOURS))
+        # И снятие владельца возвращает тур в «ничьи» (виден только админу).
+        self.s.set_profile_owner("Дни в Бишкеке", None)
+        self.assertEqual(asyncio.run(self.bot._visible_profiles(_user(GUIDE))), [])
+
+    def test_known_user_ids_lists_admin_and_guides(self):
+        self.s.add_allowed_user_id(GUIDE)
+        ids = self.bot._known_user_ids()
+        self.assertIn(OWNER, ids)   # админ из ALLOWED_USER_IDS
+        self.assertIn(GUIDE, ids)   # гид из /allow
+
     def test_import_filename_maps_to_tour_name(self):
         self.assertEqual(
             self.store.profile_name_from_filename("Памир ТяньШань 2026.xlsx"), ACTIVE

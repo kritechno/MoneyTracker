@@ -39,7 +39,10 @@ _INVALID_FILE_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
 def _active_path() -> str:
-    return os.path.join(DATA_DIR, settings.get_active_file())
+    f = settings.get_active_file()
+    # Нет активного тура (новый гид ещё ничего не создал) → заведомо несуществующий
+    # путь: чтения вернут пусто, а запись отсекается заранее в bot.py (_has_tour).
+    return os.path.join(DATA_DIR, f) if f else os.path.join(DATA_DIR, ".no-active-tour")
 
 
 def active_path() -> str:
@@ -51,6 +54,15 @@ def _path_for(name: str | None = None) -> str | None:
     """Путь к файлу тура по имени (или активного, если name=None)."""
     file = settings.get_active_file() if name is None else settings.get_profile_file(name)
     return os.path.join(DATA_DIR, file) if file else None
+
+
+def _resolve_path(profile: str | None = None) -> str:
+    """Путь к файлу указанного тура; profile=None → глобальный активный (legacy/тесты).
+    Все операции записи/чтения тура принимают profile, чтобы каждый гид работал со
+    своим туром (см. settings.get_active_profile(uid) в bot.py), а не с общим."""
+    if profile is None:
+        return _active_path()
+    return _path_for(profile) or os.path.join(DATA_DIR, f"{profile}.xlsx")
 
 
 def _safe_filename(name: str, existing: set[str] | None = None) -> str:
@@ -372,7 +384,8 @@ def _rebuild_summary(
         row += 1
 
 
-def compute_totals(since: date | None = None, up_to_id: int | None = None) -> dict:
+def compute_totals(since: date | None = None, up_to_id: int | None = None,
+                   profile: str | None = None) -> dict:
     """Считает итоги по активному туру: суммы по валютам, общую в USD и суммы по
     категориям (в USD). since — нижняя граница даты включительно.
     up_to_id — только траты с id не больше указанного (остаток «на момент траты»)."""
@@ -382,7 +395,7 @@ def compute_totals(since: date | None = None, up_to_id: int | None = None) -> di
         "total_usd": 0.0,
         "count": 0,
     }
-    path = _active_path()
+    path = _resolve_path(profile)
     if not os.path.exists(path):
         return empty
     wb = load_workbook(path, data_only=True)
@@ -391,10 +404,10 @@ def compute_totals(since: date | None = None, up_to_id: int | None = None) -> di
     return _aggregate(wb[DATA_SHEET], since, up_to_id)
 
 
-def add_expense(entry: dict) -> int:
+def add_expense(entry: dict, profile: str | None = None) -> int:
     """entry: {date, description, amount, currency, category, amount_usd}.
     Пишет в файл активного тура, возвращает стабильный id траты."""
-    path = _active_path()
+    path = _resolve_path(profile)
     wb = _load(path)
     ws = wb[DATA_SHEET]
     _ensure_ids(ws)
@@ -436,8 +449,8 @@ def _row_to_entry(ws, row: int) -> dict | None:
     }
 
 
-def get_expense(expense_id: int) -> dict | None:
-    path = _active_path()
+def get_expense(expense_id: int, profile: str | None = None) -> dict | None:
+    path = _resolve_path(profile)
     if not os.path.exists(path):
         return None
     wb = load_workbook(path)
@@ -448,9 +461,9 @@ def get_expense(expense_id: int) -> dict | None:
     return _row_to_entry(ws, row) if row else None
 
 
-def last_entry() -> dict | None:
+def last_entry(profile: str | None = None) -> dict | None:
     """Последняя добавленная трата активного тура (для /undo), либо None."""
-    path = _active_path()
+    path = _resolve_path(profile)
     if not os.path.exists(path):
         return None
     wb = load_workbook(path)
@@ -463,9 +476,9 @@ def last_entry() -> dict | None:
     return None
 
 
-def update_category(expense_id: int, category: str) -> dict | None:
+def update_category(expense_id: int, category: str, profile: str | None = None) -> dict | None:
     """Меняет категорию траты по стабильному id."""
-    path = _active_path()
+    path = _resolve_path(profile)
     wb = _load(path)
     ws = wb[DATA_SHEET]
     row = _find_row_by_id(ws, expense_id)
@@ -480,10 +493,10 @@ def update_category(expense_id: int, category: str) -> dict | None:
 
 
 def update_amount(
-    expense_id: int, amount: float, cur: str | None = None
+    expense_id: int, amount: float, cur: str | None = None, profile: str | None = None
 ) -> dict | None:
     """Меняет сумму (и при желании валюту) траты по id, пересчитывает USD."""
-    path = _active_path()
+    path = _resolve_path(profile)
     wb = _load(path)
     ws = wb[DATA_SHEET]
     row = _find_row_by_id(ws, expense_id)
@@ -504,9 +517,9 @@ def update_amount(
     return entry
 
 
-def update_description(expense_id: int, description: str) -> dict | None:
+def update_description(expense_id: int, description: str, profile: str | None = None) -> dict | None:
     """Меняет описание траты по id."""
-    path = _active_path()
+    path = _resolve_path(profile)
     wb = _load(path)
     ws = wb[DATA_SHEET]
     row = _find_row_by_id(ws, expense_id)
@@ -521,9 +534,9 @@ def update_description(expense_id: int, description: str) -> dict | None:
     return entry
 
 
-def delete_expense(expense_id: int) -> dict | None:
+def delete_expense(expense_id: int, profile: str | None = None) -> dict | None:
     """Удаляет трату по стабильному id (id остальных строк не меняются)."""
-    path = _active_path()
+    path = _resolve_path(profile)
     wb = _load(path)
     ws = wb[DATA_SHEET]
     row = _find_row_by_id(ws, expense_id)
@@ -587,14 +600,20 @@ def _normalize_imported(wb: Workbook) -> None:
         _init_wallet_sheet(wb.create_sheet(WALLET_SHEET))
 
 
+def profile_name_from_filename(filename: str) -> str:
+    """Название тура, которое получится при импорте этого файла. Нужно, чтобы
+    bot.py мог проверить владельца ДО перезаписи существующего тура."""
+    stem = os.path.splitext(os.path.basename(filename or ""))[0]
+    stem = re.sub(r"\s+", " ", _INVALID_FILE_CHARS.sub(" ", stem)).strip()
+    return stem or "Импортированный тур"
+
+
 def import_profile_from_upload(filename: str, data: bytes) -> tuple[str, bool]:
     """Импорт тура из присланного .xlsx. Имя файла → название тура: создаёт новый
     тур или заменяет файл существующего (с бэкапом), делает его активным.
     Возвращает (имя тура, replaced). Бросает исключение, если это не .xlsx."""
     wb = load_workbook(io.BytesIO(data))  # битый/не-xlsx → исключение
-    stem = os.path.splitext(os.path.basename(filename or ""))[0]
-    stem = re.sub(r"\s+", " ", _INVALID_FILE_CHARS.sub(" ", stem)).strip()
-    name = stem or "Импортированный тур"
+    name = profile_name_from_filename(filename)
 
     _normalize_imported(wb)
 
@@ -635,9 +654,10 @@ def wallet_net(name: str | None = None) -> dict:
     return _wallet_net_from_ws(wb[WALLET_SHEET])
 
 
-def add_movement(kind: str, currency: str, amount: float, note: str = "") -> dict:
+def add_movement(kind: str, currency: str, amount: float, note: str = "",
+                 profile: str | None = None) -> dict:
     """Добавляет одно движение в кошелёк активного тура, возвращает остаток."""
-    path = _active_path()
+    path = _resolve_path(profile)
     wb = _load(path)
     ws = wb[WALLET_SHEET]
     _append_movement(ws, kind, currency, amount, note)
@@ -652,9 +672,10 @@ def add_exchange(
     in_cur: str,
     in_amt: float,
     kind: str = "Обмен",
+    profile: str | None = None,
 ) -> dict:
     """Записывает обмен: списывает out_cur и зачисляет in_cur. Возвращает остаток."""
-    path = _active_path()
+    path = _resolve_path(profile)
     wb = _load(path)
     ws = wb[WALLET_SHEET]
     _append_movement(ws, kind, out_cur, -abs(float(out_amt)), f"→ {in_amt:,.2f} {in_cur}")
@@ -681,11 +702,11 @@ def list_movements(name: str | None = None) -> list[dict]:
     return out
 
 
-def delete_movement(movement_id: int) -> list[dict] | None:
+def delete_movement(movement_id: int, profile: str | None = None) -> list[dict] | None:
     """Удаляет движение кошелька активного тура по стабильному id. Обмен/Возврат
     удаляется обеими ногами (списание + зачисление), чтобы остаток не разъехался.
     Возвращает список удалённых движений (1 или 2) либо None, если id не найден."""
-    path = _active_path()
+    path = _resolve_path(profile)
     wb = _load(path)
     ws = wb[WALLET_SHEET]
     _ensure_wallet_ids(ws)
@@ -730,12 +751,12 @@ def get_start_balance(name: str | None = None) -> dict:
     return {cur: round(v, 2) for cur, v in result.items()}
 
 
-def set_start_balance(pairs: list[tuple[float, str]]) -> dict:
+def set_start_balance(pairs: list[tuple[float, str]], profile: str | None = None) -> dict:
     """Переписывает начальный баланс активного тура: удаляет прежние строки «Старт»
     и записывает новые. Пополнения и обмены не трогаются. Пустой список обнуляет
     начальный баланс. Дата прежнего «Старта» сохраняется, чтобы правка не «сдвигала»
     начальный баланс на сегодня. Возвращает остаток кошелька."""
-    path = _active_path()
+    path = _resolve_path(profile)
     wb = _load(path)
     ws = wb[WALLET_SHEET]
 
@@ -761,12 +782,12 @@ def set_start_balance(pairs: list[tuple[float, str]]) -> dict:
     return _wallet_net_from_ws(ws)
 
 
-def set_balance(pairs: list[tuple[float, str]]) -> dict:
+def set_balance(pairs: list[tuple[float, str]], profile: str | None = None) -> dict:
     """Делает текущий остаток (кошелёк − траты) по каждой валюте ровно равным
     заданному, дописывая одно движение «Коррекция» на разницу. Прежние движения и
     траты не трогаются — правка прозрачна и её видно/можно удалить в истории.
     Возвращает чистый остаток кошелька (net) после правки."""
-    path = _active_path()
+    path = _resolve_path(profile)
     wb = _load(path)
     ws = wb[WALLET_SHEET]
     net = _wallet_net_from_ws(ws)

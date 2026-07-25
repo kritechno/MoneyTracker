@@ -158,6 +158,20 @@ async def _visible_profiles(user) -> list[str]:
     return await asyncio.to_thread(settings.list_profiles, uid)
 
 
+async def _adopt_global_tour(uid: int) -> None:
+    """Разовая преемственность при переходе на per-user состояние: если у админа
+    ещё нет личного активного тура, берём глобальный активный (тот, на котором он
+    работал до обновления). Вызывать, пока contextvar не выставлен, иначе
+    get_active_profile() вернёт личный тур вместо глобального."""
+    if await asyncio.to_thread(settings.get_active_profile, uid) is not None:
+        return
+    if not await asyncio.to_thread(_is_admin, uid):
+        return
+    g = await asyncio.to_thread(settings.get_active_profile)
+    if g:
+        await asyncio.to_thread(settings.set_active_profile, g, uid)
+
+
 async def _auth_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запускается раньше всех (group=-1): чужих не пускает, обработку прерывает.
     Заодно фиксирует «текущего пользователя» для этого апдейта — дальше все функции
@@ -169,15 +183,8 @@ async def _auth_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if user is None:
         return
     if await asyncio.to_thread(_is_allowed, user.id):
-        # Разовое «усыновление»: у админа без личного активного тура берём глобальный
-        # активный (преемственность после перехода на per-user). Читаем ДО
-        # set_current_uid, пока contextvar=None, иначе get_active_profile() вернул бы
-        # уже личный тур, а не глобальный.
-        if (await asyncio.to_thread(settings.get_active_profile, user.id) is None
-                and await asyncio.to_thread(_is_admin, user.id)):
-            g = await asyncio.to_thread(settings.get_active_profile)
-            if g:
-                await asyncio.to_thread(settings.set_active_profile, g, user.id)
+        # Читаем ДО set_current_uid, пока contextvar=None (см. _adopt_global_tour).
+        await _adopt_global_tour(user.id)
         settings.set_current_uid(user.id)
         return
     if update.callback_query:
@@ -932,6 +939,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if msg is None:
         return
     await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+    # Импорт по имени файла ЗАМЕНЯЕТ одноимённый тур. Не даём гиду перезаписать
+    # чужой тур, прислав файл с таким же названием.
+    target = await asyncio.to_thread(
+        excel_store.profile_name_from_filename, msg.document.file_name
+    )
+    user = update.effective_user
+    uid = user.id if user else None
+    if await asyncio.to_thread(settings.profile_exists, target):
+        is_admin = uid is not None and await asyncio.to_thread(_is_admin, uid)
+        owns = uid is not None and await asyncio.to_thread(settings.owns, uid, target)
+        if not (is_admin or owns):
+            await msg.reply_text(
+                f"⛔️ Тур «{target}» принадлежит другому гиду — не могу его заменить.\n"
+                "Переименуй файл, чтобы создать свой тур."
+            )
+            return
     try:
         tg_file = await msg.document.get_file()
         data = bytes(await tg_file.download_as_bytearray())

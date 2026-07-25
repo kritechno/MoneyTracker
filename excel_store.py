@@ -600,14 +600,20 @@ def _normalize_imported(wb: Workbook) -> None:
         _init_wallet_sheet(wb.create_sheet(WALLET_SHEET))
 
 
+def profile_name_from_filename(filename: str) -> str:
+    """Название тура, которое получится при импорте этого файла. Нужно, чтобы
+    bot.py мог проверить владельца ДО перезаписи существующего тура."""
+    stem = os.path.splitext(os.path.basename(filename or ""))[0]
+    stem = re.sub(r"\s+", " ", _INVALID_FILE_CHARS.sub(" ", stem)).strip()
+    return stem or "Импортированный тур"
+
+
 def import_profile_from_upload(filename: str, data: bytes) -> tuple[str, bool]:
     """Импорт тура из присланного .xlsx. Имя файла → название тура: создаёт новый
     тур или заменяет файл существующего (с бэкапом), делает его активным.
     Возвращает (имя тура, replaced). Бросает исключение, если это не .xlsx."""
     wb = load_workbook(io.BytesIO(data))  # битый/не-xlsx → исключение
-    stem = os.path.splitext(os.path.basename(filename or ""))[0]
-    stem = re.sub(r"\s+", " ", _INVALID_FILE_CHARS.sub(" ", stem)).strip()
-    name = stem or "Импортированный тур"
+    name = profile_name_from_filename(filename)
 
     _normalize_imported(wb)
 

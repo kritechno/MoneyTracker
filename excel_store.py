@@ -39,7 +39,10 @@ _INVALID_FILE_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
 def _active_path() -> str:
-    return os.path.join(DATA_DIR, settings.get_active_file())
+    f = settings.get_active_file()
+    # Нет активного тура (новый гид ещё ничего не создал) → заведомо несуществующий
+    # путь: чтения вернут пусто, а запись отсекается заранее в bot.py (_has_tour).
+    return os.path.join(DATA_DIR, f) if f else os.path.join(DATA_DIR, ".no-active-tour")
 
 
 def active_path() -> str:

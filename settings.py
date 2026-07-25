@@ -1,3 +1,4 @@
+import contextvars
 import json
 import os
 import threading
@@ -18,6 +19,21 @@ _DEFAULTS = {"default_currency": "KZT"}
 # read-modify-write, а сохранение делаем атомарно (temp-файл + os.replace),
 # чтобы параллельные записи не оставили обрезанный/битый JSON.
 _lock = threading.RLock()
+
+# «Текущий пользователь» этого обновления. bot.py выставляет его один раз на
+# апдейт (pre-handler), а функции состояния без явного uid берут его отсюда —
+# так каждый гид автоматически работает со своим туром/валютой, и не нужно
+# протаскивать uid через ~45 вызовов. Через asyncio.to_thread contextvar
+# копируется в рабочий поток, а в тестах он не выставлен → фолбэк на глобальное.
+_current_uid: contextvars.ContextVar = contextvars.ContextVar("current_uid", default=None)
+
+
+def set_current_uid(uid: int | None) -> None:
+    _current_uid.set(int(uid) if uid is not None else None)
+
+
+def _effective_uid(uid: int | None) -> int | None:
+    return uid if uid is not None else _current_uid.get()
 
 
 # --- Загрузка/сохранение ----------------------------------------------------
@@ -137,6 +153,7 @@ def remove_allowed_user_id(user_id: int) -> bool:
 
 def get_default_currency(uid: int | None = None) -> str:
     data = _load()
+    uid = _effective_uid(uid)
     if uid is not None:
         st = data.get("user_state", {}).get(str(uid))
         if isinstance(st, dict) and st.get("default_currency"):
@@ -150,6 +167,7 @@ def set_default_currency(currency: str, uid: int | None = None) -> bool:
         return False
     with _lock:
         data = _load()
+        uid = _effective_uid(uid)
         if uid is None:
             data["default_currency"] = currency
         else:
@@ -193,13 +211,13 @@ def list_profiles(uid: int | None = None) -> list[str]:
 
 
 def get_active_profile(uid: int | None = None) -> str | None:
-    return _active_name(_load(), uid)
+    return _active_name(_load(), _effective_uid(uid))
 
 
 def get_active_file(uid: int | None = None) -> str | None:
     """Имя .xlsx-файла активного тура пользователя (без папки) или None."""
     data = _load()
-    name = _active_name(data, uid)
+    name = _active_name(data, _effective_uid(uid))
     if name is None:
         return None
     prof = data["profiles"].get(name)
@@ -235,6 +253,7 @@ def set_active_profile(name: str, uid: int | None = None) -> bool:
         data = _load()
         if name not in data["profiles"]:
             return False
+        uid = _effective_uid(uid)
         if uid is None:
             data["active_profile"] = name
         else:
@@ -258,7 +277,9 @@ def register_profile(name: str, file: str, owner_uid: int | None = None) -> None
         old = data["profiles"].get(name)
         keep_owner = owner_uid
         if keep_owner is None and isinstance(old, dict) and isinstance(old.get("owner_uid"), int):
-            keep_owner = old["owner_uid"]
+            keep_owner = old["owner_uid"]  # правка файла тура не меняет владельца
+        if keep_owner is None:
+            keep_owner = _current_uid.get()  # новый тур → владелец = создатель
         entry = {"file": file}
         if keep_owner is not None:
             entry["owner_uid"] = int(keep_owner)

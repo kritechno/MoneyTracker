@@ -84,6 +84,10 @@ def _take_mode(context, msg) -> dict | None:
 class _NoAmount(Exception):
     """Не удалось определить сумму траты — не записываем мусор."""
 
+
+class _NoTour(Exception):
+    """У пользователя ещё нет активного тура — некуда писать трату."""
+
 # Фразы-действия для реального обмена (двигают деньги в кошельке).
 # Применяется, если в тексте есть две суммы: первая — что отдаю, вторая — что получаю.
 _ACTION_RE = re.compile(r"(?i)(помен[яе]|обмен[яе]|размен[яе])")
@@ -140,12 +144,41 @@ def _is_admin(user_id: int) -> bool:
     return user_id == settings.get_owner_id()
 
 
+_NO_TOUR_MSG = (
+    "📂 У тебя пока нет активного тура.\n"
+    "Создай первый: /profiles → «➕ Новый тур»."
+)
+
+
+async def _visible_profiles(user) -> list[str]:
+    """Список туров для пользователя: админ видит все, гид — только свои."""
+    uid = user.id if user else None
+    if uid is not None and await asyncio.to_thread(_is_admin, uid):
+        return await asyncio.to_thread(settings.list_profiles)
+    return await asyncio.to_thread(settings.list_profiles, uid)
+
+
 async def _auth_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запускается раньше всех (group=-1): чужих не пускает, обработку прерывает."""
+    """Запускается раньше всех (group=-1): чужих не пускает, обработку прерывает.
+    Заодно фиксирует «текущего пользователя» для этого апдейта — дальше все функции
+    состояния (settings/excel_store) без явного uid работают с туром именно этого
+    гида (см. settings.set_current_uid). Сбрасываем в None в начале, чтобы id не
+    «протёк» с предыдущего апдейта."""
+    settings.set_current_uid(None)
     user = update.effective_user
     if user is None:
         return
     if await asyncio.to_thread(_is_allowed, user.id):
+        # Разовое «усыновление»: у админа без личного активного тура берём глобальный
+        # активный (преемственность после перехода на per-user). Читаем ДО
+        # set_current_uid, пока contextvar=None, иначе get_active_profile() вернул бы
+        # уже личный тур, а не глобальный.
+        if (await asyncio.to_thread(settings.get_active_profile, user.id) is None
+                and await asyncio.to_thread(_is_admin, user.id)):
+            g = await asyncio.to_thread(settings.get_active_profile)
+            if g:
+                await asyncio.to_thread(settings.set_active_profile, g, user.id)
+        settings.set_current_uid(user.id)
         return
     if update.callback_query:
         await update.callback_query.answer("⛔️ Это личный бот.", show_alert=True)
@@ -291,6 +324,8 @@ async def _enrich(entry: dict) -> dict:
 
 
 async def _process(text):
+    if await asyncio.to_thread(settings.get_active_profile) is None:
+        raise _NoTour  # у гида ещё нет тура — не создаём файл-мусор
     default_cur = await asyncio.to_thread(settings.get_default_currency)
     parsed = await asyncio.to_thread(expense_parser.parse_expense, text, default_cur)
     if parsed.parsed:
@@ -428,13 +463,17 @@ _PROFILES_INTRO = (
 
 
 async def profiles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    active = await asyncio.to_thread(settings.get_active_profile)
-    names = await asyncio.to_thread(settings.list_profiles)
     user = update.effective_user
+    active = await asyncio.to_thread(settings.get_active_profile)  # contextvar → этот гид
+    names = await _visible_profiles(user)
     can_delete = bool(user) and await asyncio.to_thread(_is_admin, user.id)
+    intro = (
+        _PROFILES_INTRO.format(active=active) if active
+        else "📂 У тебя пока нет активного тура. Создай новый:"
+    )
     await update.message.reply_text(
-        _PROFILES_INTRO.format(active=active),
-        reply_markup=_profiles_keyboard(active, names, can_delete),
+        intro,
+        reply_markup=_profiles_keyboard(active or "", names, can_delete),
     )
 
 
@@ -815,6 +854,9 @@ async def _record_expense(msg, text, success_note="", no_amount_msg=None, contex
     await msg.chat.send_action(ChatAction.TYPING)
     try:
         entry, expense_id = await _process(text)
+    except _NoTour:
+        await msg.reply_text(_NO_TOUR_MSG)
+        return
     except _NoAmount:
         await msg.reply_text(
             no_amount_msg
@@ -1353,7 +1395,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if parts[0] == "prof" and len(parts) == 2:
-        names = await asyncio.to_thread(settings.list_profiles)
+        names = await _visible_profiles(query.from_user)
         try:
             name = names[int(parts[1])]
         except (ValueError, IndexError):
@@ -1370,7 +1412,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if parts[0] == "prof_menu":
         active = await asyncio.to_thread(settings.get_active_profile)
-        names = await asyncio.to_thread(settings.list_profiles)
+        names = await _visible_profiles(query.from_user)
         can_delete = await asyncio.to_thread(_is_admin, query.from_user.id)
         await query.answer()
         await query.edit_message_text(
@@ -1383,7 +1425,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not await asyncio.to_thread(_is_admin, query.from_user.id):
             await query.answer("⛔️ Удалять туры может только владелец.", show_alert=True)
             return
-        names = await asyncio.to_thread(settings.list_profiles)
+        names = await _visible_profiles(query.from_user)
         if len(names) <= 1:
             await query.answer("Это единственный тур — удалить нельзя.", show_alert=True)
             return
@@ -1400,7 +1442,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not await asyncio.to_thread(_is_admin, query.from_user.id):
             await query.answer("⛔️ Удалять туры может только владелец.", show_alert=True)
             return
-        names = await asyncio.to_thread(settings.list_profiles)
+        names = await _visible_profiles(query.from_user)
         try:
             name = names[int(parts[1])]
         except (ValueError, IndexError):
@@ -1418,7 +1460,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not await asyncio.to_thread(_is_admin, query.from_user.id):
             await query.answer("⛔️ Удалять туры может только владелец.", show_alert=True)
             return
-        names = await asyncio.to_thread(settings.list_profiles)
+        names = await _visible_profiles(query.from_user)
         try:
             name = names[int(parts[1])]
         except (ValueError, IndexError):
@@ -1430,7 +1472,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer("Не удалось удалить (последний тур?).", show_alert=True)
             return
         active = await asyncio.to_thread(settings.get_active_profile)
-        names = await asyncio.to_thread(settings.list_profiles)
+        names = await _visible_profiles(query.from_user)
         can_delete = await asyncio.to_thread(_is_admin, query.from_user.id)
         await query.answer(f"Тур «{name}» удалён.")
         await query.edit_message_text(

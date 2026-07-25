@@ -961,8 +961,17 @@ async def _create_profile_flow(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text("Название пустое. Создать тур заново: /profiles")
         return
     if await asyncio.to_thread(settings.profile_exists, name):
-        await asyncio.to_thread(settings.set_active_profile, name)
-        await msg.reply_text(f"📂 Тур «{name}» уже есть — сделал его активным.")
+        user = update.effective_user
+        uid = user.id if user else None
+        is_admin = uid is not None and await asyncio.to_thread(_is_admin, uid)
+        owns = uid is not None and await asyncio.to_thread(settings.owns, uid, name)
+        if is_admin or owns:
+            await asyncio.to_thread(settings.set_active_profile, name)
+            await msg.reply_text(f"📂 Тур «{name}» уже есть — сделал его активным.")
+        else:
+            await msg.reply_text(
+                f"Название «{name}» уже занято. Придумай другое название для тура."
+            )
         return
     context.user_data["pending_profile_name"] = name
     await msg.reply_text(

@@ -150,6 +150,14 @@ _NO_TOUR_MSG = (
 )
 
 
+async def _has_tour() -> bool:
+    """Есть ли активный тур у текущего гида (uid — из contextvar, см. _auth_gate).
+    Кошелёк, обмены и начальный баланс пишут в файл активного тура, поэтому без
+    тура их надо останавливать ДО записи: иначе движение уходит в файл-пустышку
+    (.no-active-tour), бот рапортует об успехе, а деньги теряются."""
+    return await asyncio.to_thread(settings.get_active_profile) is not None
+
+
 async def _visible_profiles(user) -> list[str]:
     """Список туров для пользователя: админ видит все, гид — только свои."""
     uid = user.id if user else None
@@ -692,6 +700,9 @@ async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
+    if not await _has_tour():
+        await msg.reply_text(_NO_TOUR_MSG)
+        return
     arg = " ".join(context.args) if context.args else ""
     pairs = await asyncio.to_thread(currency.parse_amounts, arg)
     if not pairs:
@@ -846,6 +857,9 @@ async def _maybe_handle_exchange(msg, text) -> bool:
     pairs = await asyncio.to_thread(currency.parse_amounts, text)
     kind = _action_kind(pairs)
     if kind == "exchange":
+        if not await _has_tour():
+            await msg.reply_text(_NO_TOUR_MSG)
+            return True
         await _exchange_reply(msg, pairs)
         return True
     if kind == "ask":
@@ -1034,6 +1048,9 @@ async def _start_balance_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def _prompt_start_balance(msg, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показывает текущий начальный баланс активного профиля и ждёт новый."""
     profile = await asyncio.to_thread(settings.get_active_profile)
+    if profile is None:
+        await msg.reply_text(_NO_TOUR_MSG)
+        return
     start = await asyncio.to_thread(excel_store.get_start_balance)
     context.user_data.pop("pending_start_balance", None)
     sent = await msg.reply_text(
@@ -1059,6 +1076,9 @@ async def _prompt_set_balance(msg, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показывает текущий остаток активного тура и ждёт нужное значение, чтобы
     выставить остаток ровно таким (через движение «Коррекция»)."""
     profile = await asyncio.to_thread(settings.get_active_profile)
+    if profile is None:
+        await msg.reply_text(_NO_TOUR_MSG)
+        return
     net = await asyncio.to_thread(excel_store.wallet_net)
     t = await asyncio.to_thread(excel_store.compute_totals)
     bal = _wallet_balances(net, t["per_currency"])
@@ -1089,6 +1109,9 @@ async def _apply_set_balance(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = update.effective_user
     if user is None or not await asyncio.to_thread(_is_admin, user.id):
         await msg.reply_text("⛔️ Менять баланс может только владелец бота.")
+        return
+    if not await _has_tour():
+        await msg.reply_text(_NO_TOUR_MSG)
         return
     text = (msg.text or "").strip()
     if text.lower() in {"-", "отмена", "нет", "cancel", "skip", "пропустить"}:
@@ -1403,6 +1426,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except BadRequest:
                 pass
             return
+        if not await _has_tour():
+            await query.answer(_NO_TOUR_MSG, show_alert=True)
+            return
         async with _excel_lock:
             net = await asyncio.to_thread(excel_store.set_start_balance, pending)
             start = await asyncio.to_thread(excel_store.get_start_balance)
@@ -1650,6 +1676,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
         if parts[0] == "exwr":
+            if not await _has_tour():
+                await query.answer(_NO_TOUR_MSG, show_alert=True)
+                return
             async with _excel_lock:
                 net = await asyncio.to_thread(
                     excel_store.add_exchange, g_cur, g_amt, r_cur, r_amt
@@ -1685,6 +1714,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_reply_markup(_exchange_primary_kb("reversed", gave, received))
             return
 
+        if not await _has_tour():
+            await query.answer(_NO_TOUR_MSG, show_alert=True)
+            return
         async with _excel_lock:
             if parts[0] == "exap":
                 net = await asyncio.to_thread(

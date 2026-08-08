@@ -37,12 +37,19 @@ _INVALID_FILE_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 # --- Пути к файлам туров ----------------------------------------------------
 
+NO_TOUR_FILE = ".no-active-tour"
+
+
+class NoActiveTour(Exception):
+    """Писать некуда: у текущего гида нет активного тура."""
+
 
 def _active_path() -> str:
     f = settings.get_active_file()
     # Нет активного тура (новый гид ещё ничего не создал) → заведомо несуществующий
-    # путь: чтения вернут пусто, а запись отсекается заранее в bot.py (_has_tour).
-    return os.path.join(DATA_DIR, f) if f else os.path.join(DATA_DIR, ".no-active-tour")
+    # путь: чтения вернут пусто, а запись отсекается заранее в bot.py (_has_tour)
+    # и, на всякий случай, в _atomic_save.
+    return os.path.join(DATA_DIR, f) if f else os.path.join(DATA_DIR, NO_TOUR_FILE)
 
 
 def active_path() -> str:
@@ -85,6 +92,10 @@ def _safe_filename(name: str, existing: set[str] | None = None) -> str:
 def _atomic_save(wb: Workbook, path: str) -> None:
     """Сохраняет книгу через временный файл + os.replace, чтобы аварийное
     завершение (сон Мака, перезапуск) не оставило битый .xlsx."""
+    # Подстраховка: без активного тура путь — файл-пустышка. Лучше громкая ошибка,
+    # чем «успешно записал» в файл, который потом никто не прочитает (деньги в никуда).
+    if os.path.basename(path) == NO_TOUR_FILE:
+        raise NoActiveTour("нет активного тура — запись отменена")
     folder = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(folder, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=".tour_", suffix=".xlsx")

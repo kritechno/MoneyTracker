@@ -1,16 +1,18 @@
 # MoneyTracker
 
+[![CI](https://github.com/kritechno/MoneyTracker/actions/workflows/ci.yml/badge.svg)](https://github.com/kritechno/MoneyTracker/actions/workflows/ci.yml)
+
 A Telegram bot for tracking trip expenses across several currencies. I built it for the guides of my tour company, who log spending in tenge, som, dollars and euros while on the road.
 
 - Write an expense as plain text, or send a receipt photo with a caption. A local parser handles simple entries; Gemini is the fallback for messy ones.
 - Six currencies with live conversion to USD, plus a wallet that tracks top-ups and real cash exchanges.
 - One Excel file per tour, each with its own balance, exportable and importable from the chat.
 - Several users with per-user routing, an owner role and an allow-list.
-- Covered by a unit test suite.
+- Covered by 94 unit tests that run in CI.
 
 Stack: Python, python-telegram-bot, Gemini API, openpyxl. No expense data is stored in this repository.
 
-The full documentation below is in Russian.
+Licensed under MIT. The full documentation below is in Russian.
 
 ---
 

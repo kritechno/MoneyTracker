@@ -8,7 +8,8 @@ SRC="$(cd "$(dirname "$0")" && pwd)/$PLIST"
 DEST="$HOME/Library/LaunchAgents/$PLIST"
 
 mkdir -p "$HOME/Library/LaunchAgents"
-cp "$SRC" "$DEST"
+# Подставляем путь к проекту вместо плейсхолдера в шаблоне plist
+sed "s|__PROJECT_DIR__|$(dirname "$SRC")|g" "$SRC" > "$DEST"
 
 # Перезагружаем, если уже был установлен
 launchctl unload "$DEST" 2>/dev/null || true

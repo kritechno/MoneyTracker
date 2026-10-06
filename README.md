@@ -1,4 +1,20 @@
-# MoneyTracker — Telegram-бот учёта трат
+# MoneyTracker
+
+A Telegram bot for tracking trip expenses across several currencies. I built it for the guides of my tour company, who log spending in tenge, som, dollars and euros while on the road.
+
+- Write an expense as plain text, or send a receipt photo with a caption. A local parser handles simple entries; Gemini is the fallback for messy ones.
+- Six currencies with live conversion to USD, plus a wallet that tracks top-ups and real cash exchanges.
+- One Excel file per tour, each with its own balance, exportable and importable from the chat.
+- Several users with per-user routing, an owner role and an allow-list.
+- Covered by a unit test suite.
+
+Stack: Python, python-telegram-bot, Gemini API, openpyxl. No expense data is stored in this repository.
+
+The full documentation below is in Russian.
+
+---
+
+## MoneyTracker — Telegram-бот учёта трат
 
 Личный Telegram-бот для учёта расходов в поездках. Пользователь пишет трату текстом
 или отправляет фото чека с подписью. Бот записывает расход в Excel, считает итоги по
@@ -60,7 +76,7 @@ ALLOWED_USER_IDS=123456789
 ## Установка
 
 ```bash
-cd /Users/a.buzubayev/Documents/CODING_projects/MoneyTracker
+cd MoneyTracker
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt

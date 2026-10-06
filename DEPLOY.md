@@ -41,7 +41,7 @@ ssh -i ~/Downloads/ssh-key-XXXX.key ubuntu@ТВОЙ_IP
 
 С Мака, из папки проекта:
 ```bash
-cd /Users/a.buzubayev/Documents/CODING_projects/MoneyTracker
+cd MoneyTracker
 ./deploy_push.sh ТВОЙ_IP ~/Downloads/ssh-key-XXXX.key
 ```
 Код окажется в `~/MoneyTracker` на сервере. Файл `.env` (с токенами) тоже загрузится.
@@ -106,7 +106,7 @@ rm ~/Library/LaunchAgents/com.moneytracker.bot.plist
 ```bash
 # на Маке
 scp -i ~/Downloads/ssh-key-XXXX.key \
-    /Users/a.buzubayev/Documents/CODING_projects/MoneyTracker/expenses.xlsx \
+    expenses.xlsx \
     ubuntu@ТВОЙ_IP:~/MoneyTracker/expenses.xlsx
 # затем на сервере перезапусти бота:
 sudo systemctl restart moneytracker

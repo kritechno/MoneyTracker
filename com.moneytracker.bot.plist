@@ -7,12 +7,12 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/a.buzubayev/Documents/CODING_projects/MoneyTracker/.venv/bin/python3</string>
-        <string>/Users/a.buzubayev/Documents/CODING_projects/MoneyTracker/bot.py</string>
+        <string>__PROJECT_DIR__/.venv/bin/python3</string>
+        <string>__PROJECT_DIR__/bot.py</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/a.buzubayev/Documents/CODING_projects/MoneyTracker</string>
+    <string>__PROJECT_DIR__</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -21,9 +21,9 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/a.buzubayev/Documents/CODING_projects/MoneyTracker/bot.log</string>
+    <string>__PROJECT_DIR__/bot.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/a.buzubayev/Documents/CODING_projects/MoneyTracker/bot.log</string>
+    <string>__PROJECT_DIR__/bot.log</string>
 </dict>
 </plist>
